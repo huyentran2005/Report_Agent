@@ -279,5 +279,3 @@ streamlit run app.py --server.port=8502
 - Không coi ràng buộc widget là lớp bảo mật; dữ liệu nhạy cảm vẫn cần được kiểm tra ở backend.
 - Nên xóa định kỳ `local_app_data/uploads` và `local_app_data/reports` nếu dữ liệu có tính riêng tư.
 
-#   R e p o r t _ A g e n t  
- 
