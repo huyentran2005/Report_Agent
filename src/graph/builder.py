@@ -52,17 +52,13 @@ def after_report_drafting(state: GraphState) -> str:
 
 
 def after_safety_check(state: GraphState) -> str:
-    if state.get("status") != "error":
+    if state.get("status") == "safety_checked":
         return "report_finalization"
-
-    if not state.get("report_sections_draft"):
-        logger.error("Stopping workflow because there is no report draft to export.")
-        return END
-
-    state["status"] = "safety_warning"
-    state["error_message"] = (state.get("error_message") or "") + "\nBáo cáo chưa vượt qua bước kiểm tra tự động; vui lòng xem lại các phát hiện quan trọng."
-    logger.warning("Safety review did not pass; exporting with a validation warning.")
-    return "report_finalization"
+    if state.get("status") == "needs_report_revision":
+        logger.warning("Accuracy validation requested a new LLM report draft.")
+        return "report_drafting"
+    logger.error("Stopping workflow because safety/accuracy validation did not pass.")
+    return END
 
 
 def create_graph_workflow():

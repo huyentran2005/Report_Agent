@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from difflib import SequenceMatcher
 from typing import Any
 
 from graph.state import GraphState
@@ -54,10 +53,6 @@ def _sample_size(item) -> int | None:
         ]
         return int(sum(sizes)) if sizes else None
     return None
-
-
-def _normalized(text: str) -> str:
-    return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
 
 
 def validate_evidence(state: GraphState) -> GraphState:
@@ -116,8 +111,8 @@ def validate_evidence(state: GraphState) -> GraphState:
         insight.source_sheet = insight.source_partition
         insight.source_columns = list(dict.fromkeys(column for item in linked for column in item.columns))
         insight.filters = {
-            item.question_id: item.parameters.get("filters", {}) for item in linked
-            if item.parameters.get("filters")
+            item.question_id: (item.parameters.get("analysis_plan") or {}).get("filters", [])
+            for item in linked if (item.parameters.get("analysis_plan") or {}).get("filters")
         }
         sizes = [size for item in linked if (size := _sample_size(item)) is not None]
         insight.sample_size = max(sizes) if sizes else None
@@ -137,44 +132,21 @@ def validate_evidence(state: GraphState) -> GraphState:
         insight.limitations = list(dict.fromkeys(insight.limitations))
         insight.evidence_valid = True
 
-        duplicate = next((existing for existing in valid if
-            SequenceMatcher(None, _normalized(existing.title), _normalized(insight.title)).ratio() >= 0.82
-            and existing.source_columns == insight.source_columns
-        ), None)
-        if duplicate:
-            if duplicate.source_partition == insight.source_partition:
-                rejected.append((insight.insight_id, f"trùng nội dung với {duplicate.insight_id}"))
-                continue
-
-
-
-            duplicate.evidence_question_ids.extend(
-                qid for qid in insight.evidence_question_ids
-                if qid not in duplicate.evidence_question_ids
-            )
-            duplicate.metrics.update(insight.metrics)
-            duplicate.question = f"{duplicate.question} | {insight.question}"
-            duplicate.narrative = f"{duplicate.narrative}\n{insight.narrative}"
-            duplicate.limitations.extend(
-                limitation for limitation in insight.limitations
-                if limitation not in duplicate.limitations
-            )
-            duplicate.limitations.append(
-                "Các metric cùng chủ đề đến từ những tập dữ liệu khác nhau; chỉ so sánh khi phạm vi và mẫu số tương đương."
-            )
-            duplicate.source_partition = "multiple_sources"
-            duplicate.source_sheet = None
-            if duplicate.sample_size != insight.sample_size:
-                duplicate.sample_size = None
-            if duplicate.denominator != insight.denominator:
-                duplicate.denominator = None
-            rejected.append((insight.insight_id, f"đã gộp vào {duplicate.insight_id}"))
-            continue
         valid.append(insight)
 
     if not valid:
         state["status"] = "error"
-        state["error_message"] = "Không có phát hiện nào vượt qua kiểm chứng evidence."
+        state["error_message"] = (
+            "Không có insight nào vượt qua Evidence Validation. "
+            f"Chi tiết: {rejected}"
+        )
+        return state
+    if rejected:
+        state["status"] = "error"
+        state["error_message"] = (
+            f"Evidence validation không bao phủ đủ {len(candidates)} câu hỏi; "
+            f"đã loại {len(rejected)} insight: {rejected}"
+        )
         return state
     state["analysis_insights"] = valid
     state["validated_insights"] = valid

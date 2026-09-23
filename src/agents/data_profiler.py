@@ -12,7 +12,7 @@ from langchain_core.prompts import PromptTemplate
 from llm import get_llm, text_from_response
 from pydantic import BaseModel, Field, ValidationError
 from graph.state import GraphState
-from schemas.messages import DataProfile
+from schemas.messages import DataProfile, DimensionScope, PartitionDataScope
 from privacy import is_person_name_column
 from data_io import (effective_instructions, extract_instruction_context, infer_column_semantic,
                      fallback_sheet_classifications, inspect_workbook, is_date_like_series, read_dataset_partitions,
@@ -93,6 +93,8 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             detail["min"] = str(parsed_dates.min()) if parsed_dates.notna().any() else None
             detail["max"] = str(parsed_dates.max()) if parsed_dates.notna().any() else None
             detail["period_count"] = int(parsed_dates.dropna().dt.to_period("M").nunique())
+            detail["years"] = sorted(int(year) for year in parsed_dates.dropna().dt.year.unique())
+            detail["periods"] = sorted(str(period) for period in parsed_dates.dropna().dt.to_period("M").unique())
         elif pd.api.types.is_numeric_dtype(df[col]) and semantic_type == "numeric_measure":
             for name, value in (("mean", df[col].mean()), ("std", df[col].std())):
                 detail[name] = float(value) if pd.notna(value) else None
@@ -107,6 +109,51 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             detail["top_5_values"] = {str(key): int(value) for key, value in top_values.items()}
         details_by_column[col_name] = detail
     return details_by_column
+
+
+def _profile_data_scope(source_partition: str, df: pd.DataFrame) -> PartitionDataScope:
+    """Capture actual dimension domains without asking the LLM to infer them."""
+    dimensions: list[DimensionScope] = []
+    for column in df.columns:
+        name = str(column)
+        if name.startswith("_") or is_person_name_column(name, df[column]):
+            continue
+        semantic = infer_column_semantic(df[column], name)
+        if is_date_like_series(df[column], name):
+            dates = to_datetime_series(df[column]).dropna()
+            dimensions.append(DimensionScope(
+                column=name, kind="time", valid_count=int(dates.size),
+                unique_count=int(dates.nunique()),
+                min_date=dates.min().isoformat() if not dates.empty else None,
+                max_date=dates.max().isoformat() if not dates.empty else None,
+                years=sorted(int(year) for year in dates.dt.year.unique()),
+                periods=sorted(str(period) for period in dates.dt.to_period("M").unique()),
+            ))
+        elif semantic in {"categorical", "boolean/status"}:
+            values = df[column].dropna().unique().tolist()
+            complete = len(values) <= 100
+            normalized = name.casefold()
+            if any(token in normalized for token in (
+                "region", "country", "city", "state", "province", "district",
+                "khu vực", "quốc gia", "tỉnh", "thành phố",
+            )):
+                kind = "geography"
+            elif any(token in normalized for token in (
+                "ship", "delivery", "channel", "method", "mode",
+                "vận chuyển", "giao hàng", "phương thức", "kênh",
+            )):
+                kind = "operation"
+            else:
+                kind = "category"
+            dimensions.append(DimensionScope(
+                column=name, kind=kind, valid_count=int(df[column].notna().sum()),
+                unique_count=int(df[column].nunique()),
+                values=[str(value) for value in values] if complete else [],
+                values_complete=complete,
+            ))
+    return PartitionDataScope(
+        source_partition=source_partition, row_count=len(df), dimensions=dimensions
+    )
 
 
 def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict[str, Any]]:
@@ -260,14 +307,19 @@ def profile_dataset(state: GraphState) -> GraphState:
         return state
 
     sheet_profiles = {}
+    data_scope_profiles = {}
     for name, frame in analysis_frames.items():
         column_details = _profile_frame(frame)
+        data_scope = _profile_data_scope(name, frame)
+        data_scope_profiles[name] = data_scope.model_dump(mode="json")
         sheet_profiles[name] = {
             "num_rows": len(frame), "num_columns": len(column_details),
             "column_details": column_details, "key_observations": "",
+            "data_scope": data_scope.model_dump(mode="json"),
         }
     state["analysis_partitions"] = list(analysis_frames)
     state["sheet_profiles"] = sheet_profiles
+    state["data_scope_profiles"] = data_scope_profiles
     if len(sheet_profiles) == 1:
         only_profile = next(iter(sheet_profiles.values()))
         aggregate_details = {

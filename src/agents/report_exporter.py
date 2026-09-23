@@ -29,7 +29,7 @@ _evidence_table_html = evidence_table_html
 
 
 def _tables_without_visual_coverage(tables, theme_question_ids, matching_visuals):
-    """Keep detail tables only when no chart already covers all their evidence."""
+    """Keep a table only when no chart already presents the same evidence."""
     visual_question_ids = {
         question_id
         for visual in matching_visuals
@@ -54,8 +54,8 @@ def _tables_without_visual_coverage(tables, theme_question_ids, matching_visuals
 
 
 
-def _create_pdf_fallback(markdown_text: str, output_path: str, visuals, visuals_by_figure=None) -> None:
-    """Create a Windows-friendly PDF without GTK/Pango dependencies."""
+def _create_pdf_report(markdown_text: str, output_path: str, visuals_by_figure=None) -> None:
+    """Create the report PDF with the configured ReportLab renderer."""
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4
@@ -71,11 +71,7 @@ def _create_pdf_fallback(markdown_text: str, output_path: str, visuals, visuals_
         TableStyle,
     )
 
-    try:
-        font_name, font_bold = register_reportlab_fonts()
-    except Exception as font_err:
-        logger.warning("Could not register DejaVu Sans for ReportLab fallback: %s", font_err)
-        font_name, font_bold = "Helvetica", "Helvetica-Bold"
+    font_name, font_bold = register_reportlab_fonts()
 
     navy = colors.HexColor(COLOR_NAVY)
     navy_light = colors.HexColor(COLOR_NAVY_LIGHT)
@@ -236,9 +232,19 @@ def _create_pdf_fallback(markdown_text: str, output_path: str, visuals, visuals_
                 row_html = re.findall(r"<tr>(.*?)</tr>", block_text, re.DOTALL)
                 table_rows = []
                 for row_index, row in enumerate(row_html):
-                    cells = [plain_html(cell) for cell in re.findall(r"<t[hd]>(.*?)</t[hd]>", row, re.DOTALL)]
+                    cells = [
+                        plain_html(cell)
+                        for cell in re.findall(r"<t[hd](?:\s[^>]*)?>(.*?)</t[hd]>", row, re.DOTALL)
+                    ]
                     if cells:
-                        table_rows.append([Paragraph(f"<b>{rich_text(cell)}</b>" if row_index == 0 else rich_text(cell), body) for cell in cells])
+                        table_rows.append([
+                            Paragraph(
+                                f'<font color="#FFFFFF"><b>{rich_text(cell)}</b></font>'
+                                if row_index == 0 else rich_text(cell),
+                                body,
+                            )
+                            for cell in cells
+                        ])
                 if table_rows:
                     evidence_table = Table(table_rows, repeatRows=1, hAlign="LEFT")
                     evidence_table.setStyle(TableStyle([
@@ -356,17 +362,8 @@ def export_report(state: GraphState) -> GraphState:
         final_report_content_md_sections.append(report_sections_draft.introduction_text)
 
         section_number = 2
-        if report_sections_draft.data_quality_text.strip():
-            final_report_content_md_sections.append(
-                f"\n## {section_number}. Data Quality and Analytical Scope\n"
-                if report_language == "English"
-                else f"\n## {section_number}. Chất lượng và phạm vi dữ liệu\n"
-            )
-            final_report_content_md_sections.append(report_sections_draft.data_quality_text)
-            section_number += 1
 
-
-        if report_sections_draft.analysis_narratives:
+        if report_sections_draft.analysis_narratives or generated_visuals:
             analysis_section_number = section_number
             section_number += 1
             final_report_content_md_sections.append(
@@ -378,13 +375,18 @@ def export_report(state: GraphState) -> GraphState:
         multi_partition = False
         visuals_by_id = {visual.visual_id: visual for visual in generated_visuals} if generated_visuals else {}
         embedded_visual_ids = set()
-        mapped_figure_numbers = [
-            int(match.group(0))
-            for placeholder in (report_sections_draft.figure_id_map or {})
-            if (match := re.search(r"\d+", placeholder))
-        ]
-        next_figure_number = max(mapped_figure_numbers, default=0) + 1
-        supplementary_visuals_by_figure = {}
+        all_visual_question_ids = {
+            question_id
+            for visual in (generated_visuals or [])
+            for question_id in visual.evidence_question_ids
+        }
+        # Tables covered by a chart are intentionally considered handled so they
+        # are not reintroduced later in the unmatched-table appendix.
+        embedded_table_ids = {
+            id(table)
+            for table in (report_plan.evidence_tables if report_plan else [])
+            if set(table.evidence_question_ids).issubset(all_visual_question_ids)
+        }
         current_partition = None
         partition_index = 0
         finding_index = 0
@@ -396,14 +398,10 @@ def export_report(state: GraphState) -> GraphState:
                 insight = insight_by_id.get(insight_id)
                 if insight:
                     theme_question_ids.update(insight.evidence_question_ids)
-            matching_visuals = [
-                visual for visual in (generated_visuals or [])
-                if theme_question_ids.intersection(visual.evidence_question_ids)
-            ]
             matching_tables = _tables_without_visual_coverage(
                 report_plan.evidence_tables if report_plan else [],
                 theme_question_ids,
-                matching_visuals,
+                generated_visuals or [],
             )
             current_narrative_text = narrative_original_md
             embedded_visuals_html_for_this_narrative = []
@@ -506,26 +504,9 @@ def export_report(state: GraphState) -> GraphState:
                 )
             for table in matching_tables:
                 final_report_content_md_sections.append(_evidence_table_html(table))
+                embedded_table_ids.add(id(table))
             final_report_content_md_sections.append(body_from_narrative)
             final_report_content_md_sections.extend(embedded_visuals_html_for_this_narrative)
-            for visual_obj in matching_visuals:
-                if visual_obj.visual_id in embedded_visual_ids or not os.path.exists(visual_obj.file_path):
-                    continue
-                figure_number = next_figure_number
-                next_figure_number += 1
-                try:
-                    encoded = base64.b64encode(open(visual_obj.file_path, "rb").read()).decode("ascii")
-                    image_source = f"data:image/png;base64,{encoded}"
-                except OSError:
-                    image_source = f"file:///{os.path.abspath(visual_obj.file_path).replace(os.sep, '/')}"
-                caption = escape(re.sub(r"^\[[^\]]+\]\s*", "", visual_obj.description or "Biểu đồ dữ liệu"))
-                final_report_content_md_sections.append(
-                    "\n\n<div class=\"figure\">\n"
-                    f'<img src="{image_source}" alt="{caption}">\n'
-                    f'<p class="figcaption"><strong>{"Figure" if report_language == "English" else "Hình"} {figure_number}:</strong> {caption}</p>\n'
-                    "</div>\n\n"
-                )
-                embedded_visual_ids.add(visual_obj.visual_id)
             final_report_content_md_sections.append("\n")
 
         remaining_visuals = [
@@ -533,30 +514,23 @@ def export_report(state: GraphState) -> GraphState:
             if visual.visual_id not in embedded_visual_ids and os.path.exists(visual.file_path)
         ]
         if remaining_visuals:
-            final_report_content_md_sections.append(
-                "\n### Supplementary Data Visualizations\n"
-                if report_language == "English"
-                else "\n### Trực quan hóa dữ liệu bổ sung\n"
+            raise ValueError(
+                "Report draft chưa ánh xạ các biểu đồ vào narrative: "
+                f"{[visual.visual_id for visual in remaining_visuals]}"
             )
-            for visual in remaining_visuals:
-                figure_number = next_figure_number
-                next_figure_number += 1
-                supplementary_visuals_by_figure[str(figure_number)] = visual
-                try:
-                    encoded = base64.b64encode(open(visual.file_path, "rb").read()).decode("ascii")
-                    image_source = f"data:image/png;base64,{encoded}"
-                except OSError:
-                    image_source = f"file:///{os.path.abspath(visual.file_path).replace(os.sep, '/')}"
-                description = re.sub(r"^\[[^\]]+\]\s*", "", visual.description or "")
-                caption = escape(description or ("Data visualization" if report_language == "English"
-                                                  else "Biểu đồ dữ liệu"))
-                final_report_content_md_sections.append(
-                    "\n\n"
-                    f'<div class="figure">\n'
-                    f'<img src="{image_source}" alt="{caption}">\n'
-                    f'<p class="figcaption"><strong>{"Figure" if report_language == "English" else "Hình"} {figure_number}:</strong> {caption}</p>\n'
-                    "</div>\n\n"
-                )
+
+        remaining_tables = [
+            table for table in (report_plan.evidence_tables if report_plan else [])
+            if id(table) not in embedded_table_ids
+        ]
+        if remaining_tables:
+            final_report_content_md_sections.append(
+                "\n### Supplementary Evidence Tables\n"
+                if report_language == "English"
+                else "\n### Bảng dữ liệu kiểm chứng bổ sung\n"
+            )
+            for table in remaining_tables:
+                final_report_content_md_sections.append(_evidence_table_html(table))
 
         if report_sections_draft.notable_issues:
             final_report_content_md_sections.append(
@@ -815,32 +789,25 @@ def export_report(state: GraphState) -> GraphState:
             """
 
             report_pdf_file_path = os.path.join(report_output_dir, f"{report_filename_base}.pdf")
-            try:
-                from weasyprint import HTML
-                HTML(string=html_content, base_url=report_output_dir).write_pdf(report_pdf_file_path)
-                pdf_file_path = report_pdf_file_path
-                logger.info("Final PDF report saved to: %s", pdf_file_path)
-            except (ImportError, OSError) as weasyprint_error:
-                logger.warning("WeasyPrint unavailable (%s); using ReportLab fallback.", weasyprint_error)
-                visuals_by_figure = {
-                    match.group(0): visual
-                    for placeholder, visual_id in (report_sections_draft.figure_id_map or {}).items()
-                    for match in [re.search(r"\d+", placeholder)]
-                    if match and (visual := visuals_by_id.get(visual_id))
-                }
-                visuals_by_figure.update(supplementary_visuals_by_figure)
-                _create_pdf_fallback(
-                    full_report_string_md,
-                    report_pdf_file_path,
-                    generated_visuals,
-                    visuals_by_figure,
-                )
-                pdf_file_path = report_pdf_file_path
+            visuals_by_figure = {
+                match.group(0): visual
+                for placeholder, visual_id in (report_sections_draft.figure_id_map or {}).items()
+                for match in [re.search(r"\d+", placeholder)]
+                if match and (visual := visuals_by_id.get(visual_id))
+            }
+            _create_pdf_report(
+                full_report_string_md,
+                report_pdf_file_path,
+                visuals_by_figure,
+            )
+            pdf_file_path = report_pdf_file_path
+            logger.info("Final PDF report saved to: %s", pdf_file_path)
 
         except Exception as e:
             logger.error(f"Error generating PDF report for request {request_id}: {e}", exc_info=True)
-            state['error_message'] = (state.get('error_message') or "") + f"\nError generating PDF: {e}"
-            pdf_file_path = None
+            state['status'] = "error"
+            state['error_message'] = f"Error generating PDF: {e}"
+            return state
 
 
         state['final_report'] = ReportFormat(

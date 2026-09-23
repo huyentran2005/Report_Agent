@@ -63,11 +63,11 @@ def _is_readable_instruction(item: VisualGenerationInstruction, df: pd.DataFrame
     chart_type = item.type.lower()
     if chart_type == "pie":
         return len(item.columns) == 1 and df[item.columns[0]].nunique(dropna=True) <= 6
-    if chart_type == "bar":
+    if chart_type in {"bar", "horizontal_bar"}:
         axis_column = item.columns[0]
         if not pd.api.types.is_numeric_dtype(df[axis_column]):
             return _is_readable_category(df[axis_column])
-    if chart_type == "line" and item.columns:
+    if chart_type in {"line", "area"} and item.columns:
         axis_column = item.columns[0]
         if not _looks_like_date(df[axis_column]) and not pd.api.types.is_numeric_dtype(df[axis_column]):
             return _is_readable_category(df[axis_column])
@@ -88,16 +88,16 @@ def _fallback_suggestions(df: pd.DataFrame) -> List[VisualGenerationInstruction]
     ]
     suggestions: List[VisualGenerationInstruction] = []
     if date_column and numeric:
-        for value_column in numeric[:2]:
+        for value_column in numeric:
             suggestions.append(VisualGenerationInstruction(type="line", columns=[date_column, value_column], title=f"Xu hướng {value_column} theo thời gian", description=f"Diễn biến {value_column} theo các kỳ tháng được chuẩn hóa từ {date_column}."))
     if categorical and numeric:
-        for group_column in categorical[:2]:
+        for group_column in categorical:
             suggestions.append(VisualGenerationInstruction(type="bar", columns=[group_column, numeric[0]], title=f"{numeric[0]} theo {group_column}", description="So sánh giá trị giữa các nhóm bằng các cột dễ đọc."))
     if categorical:
         suggestions.append(VisualGenerationInstruction(type="bar", columns=[categorical[0]], title=f"Số lượng theo {categorical[0]}", description="Đếm số bản ghi trong từng nhóm."))
     if not suggestions and numeric:
         suggestions.append(VisualGenerationInstruction(type="bar", columns=[numeric[0]], title=f"Giá trị {numeric[0]}", description="Tóm tắt các giá trị bằng biểu đồ cột."))
-    return suggestions[:4]
+    return suggestions
 
 
 def _suggestions_from_results(df: pd.DataFrame, results) -> List[VisualGenerationInstruction]:
@@ -151,11 +151,26 @@ def _suggestions_from_results(df: pd.DataFrame, results) -> List[VisualGeneratio
         )
         if _is_readable_instruction(item, df):
             suggestions.append(item)
-    return suggestions[:4]
+    return suggestions
 
 
 def _chart_title_from_result(result) -> str:
     """Create a declarative chart title without exposing an internal question."""
+    plan = result.parameters.get("analysis_plan") or {}
+    group_by = plan.get("group_by") or []
+    metrics = plan.get("metrics") or []
+    transforms = [item.get("type") for item in plan.get("transforms") or []]
+    if plan.get("time_grain") and group_by:
+        metric = metrics[0] if metrics else "Số lượng"
+        if "pct_change" in transforms:
+            return f"Tăng trưởng {metric} theo {group_by[0]}"
+        return f"Xu hướng {metric} theo {group_by[0]}"
+    if group_by and metrics:
+        if "share_of_total" in transforms:
+            return f"Tỷ trọng {metrics[0]} theo {group_by[0]}"
+        return f"{metrics[0]} theo {group_by[0]}"
+    if group_by:
+        return f"Số lượng theo {group_by[0]}"
     if result.operation == "trend_over_time":
         return f"Xu hướng {result.columns[-1]} theo {result.columns[0]}"
     if result.operation == "mean_by_group" and len(result.columns) >= 2:
@@ -179,46 +194,120 @@ def _reader_friendly(items: List[VisualGenerationInstruction], df: pd.DataFrame)
     """Remove specialist chart types from a report intended for general readers."""
     friendly = [
         item for item in items
-        if (item.type.lower() in {"bar", "line", "histogram", "boxplot", "scatter"}
+        if (item.type.lower() in {"bar", "horizontal_bar", "line", "area", "histogram", "boxplot", "scatter"}
             or (item.type.lower() == "pie" and len(item.columns) == 1))
         and _is_readable_instruction(item, df)
     ]
-    return friendly[:6]
+    return friendly
 
 
-def _generate_chart_from_audited_result(result, output_path: str) -> Optional[str]:
+def _chart_type_from_result(result) -> str:
+    """Choose a readable chart from the structured plan and audited result shape."""
+    plan = result.parameters.get("analysis_plan") or {}
+    transforms = {item.get("type") for item in plan.get("transforms") or []}
+    requested = str(result.parameters.get("visualization") or "").casefold()
+    aliases = {"horizontal bar": "horizontal_bar", "barh": "horizontal_bar", "donut": "pie"}
+    requested = aliases.get(requested, requested)
+    supported = {"bar", "horizontal_bar", "line", "area", "pie", "scatter", "histogram", "boxplot"}
+    if requested in supported:
+        return requested
+    if "correlation" in transforms:
+        return "scatter"
+    if "distribution" in transforms:
+        return "histogram"
+    if "outlier_iqr" in transforms:
+        return "boxplot"
+    if plan.get("time_grain"):
+        return "area" if "cumulative" in transforms else "line"
+    if "share_of_total" in transforms:
+        return "pie"
+    records = result.result if isinstance(result.result, list) else []
+    return "horizontal_bar" if len(records) > 8 else "bar"
+
+
+def _generate_chart_from_audited_result(
+    result, output_path: str, chart_type: Optional[str] = None,
+    dimension_override: Optional[str] = None, metric_override: Optional[str] = None,
+) -> Optional[str]:
     """Render group/trend charts from the exact audited records, not raw re-aggregation."""
     if not isinstance(result.result, list) or len(result.result) < 2:
         return None
     records = [record for record in result.result if isinstance(record, dict)]
     if len(records) < 2:
         return None
-    dimension = "period" if result.operation == "trend_over_time" else result.columns[0]
+    plan = result.parameters.get("analysis_plan") or {}
+    group_by = plan.get("group_by") or []
+    dimension = dimension_override or (
+        group_by[0] if group_by else
+        ("period" if result.operation == "trend_over_time" else result.columns[0])
+    )
     if any(dimension not in record for record in records):
         return None
     metric_keys = [
         key for key in records[0]
         if key not in {dimension, "sample_size"}
-        and all(isinstance(record.get(key), (int, float)) for record in records)
+        and all(record.get(key) is None or isinstance(record.get(key), (int, float)) for record in records)
+        and any(isinstance(record.get(key), (int, float)) for record in records)
     ]
     if not metric_keys:
         return None
-    metric = metric_keys[0]
-    values = pd.Series([record[metric] for record in records], dtype="float64")
+    transform_outputs = [
+        item.get("output_column") or (
+            f"{item.get('type')}_{item.get('column')}"
+            if item.get("type") in {"pct_change", "difference", "cumulative", "rank", "rolling_mean"}
+            and item.get("column") else None
+        )
+        for item in plan.get("transforms") or []
+    ]
+    metric = metric_override or next(
+        (key for key in reversed(transform_outputs) if key in metric_keys), metric_keys[0]
+    )
+    if metric not in metric_keys:
+        return None
+    chart_frame = pd.DataFrame(records)[[dimension, metric]].dropna()
+    if chart_frame.empty:
+        return None
+    if chart_frame[dimension].duplicated().any():
+        aggregation = plan.get("aggregation")
+        if aggregation in {"sum", "count"}:
+            chart_frame = chart_frame.groupby(dimension, as_index=False, sort=False)[metric].sum()
+        elif aggregation in {"min", "max"}:
+            chart_frame = getattr(
+                chart_frame.groupby(dimension, as_index=False, sort=False)[metric], aggregation
+            )()
+        else:
+            return None
+    values = pd.to_numeric(chart_frame[metric], errors="coerce")
     if values.nunique(dropna=True) < 2:
         return None
 
-    labels = [str(record[dimension]) for record in records]
+    labels = chart_frame[dimension].astype(str).tolist()
     fig, ax = plt.subplots(figsize=(10, 5.6), facecolor="white")
     ax.set_facecolor("white")
-    if result.operation == "trend_over_time":
+    is_time_series = bool(plan.get("time_grain")) or result.operation == "trend_over_time"
+    chart_type = chart_type or _chart_type_from_result(result)
+    if chart_type == "area":
+        ax.fill_between(labels, values, color=CHART_TEAL, alpha=0.3)
+        ax.plot(labels, values, color=CHART_NAVY, marker="o", linewidth=2.2)
+        chart_code = f"audited_result.plot.area(x={dimension!r}, y={metric!r})"
+    elif chart_type == "pie":
+        ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90,
+               colors=sns.color_palette([CHART_NAVY, CHART_TEAL, CHART_ORANGE], len(values)),
+               wedgeprops={"width": 0.62, "linewidth": 1.2, "edgecolor": "white"})
+        chart_code = f"audited_result.plot.pie(labels={dimension!r}, y={metric!r})"
+    elif chart_type == "horizontal_bar":
+        bars = ax.barh(labels, values, color=CHART_TEAL)
+        ax.bar_label(bars, fmt="{:,.2f}", padding=3, fontsize=8, color=CHART_TEXT)
+        chart_code = f"audited_result.plot.barh(y={dimension!r}, x={metric!r})"
+    elif is_time_series or chart_type == "line":
         ax.plot(labels, values, color=CHART_NAVY, marker="o", linewidth=2.2)
         chart_code = f"audited_result.plot.line(x={dimension!r}, y={metric!r})"
     else:
         bars = ax.bar(labels, values, color=CHART_TEAL)
         ax.bar_label(bars, fmt="{:,.2f}", padding=3, fontsize=8, color=CHART_TEXT)
         chart_code = f"audited_result.plot.bar(x={dimension!r}, y={metric!r})"
-    ax.set_title(_chart_title_from_result(result), color=CHART_NAVY, fontsize=14, fontweight="bold", pad=14)
+    chart_title = f"{metric} theo {dimension}" if dimension_override or metric_override else _chart_title_from_result(result)
+    ax.set_title(chart_title, color=CHART_NAVY, fontsize=14, fontweight="bold", pad=14)
     ax.set_xlabel(str(dimension).replace("_", " ").title(), fontweight="bold", color=CHART_TEXT)
     ax.set_ylabel(str(metric).replace("_", " ").title(), fontweight="bold", color=CHART_TEXT)
     ax.tick_params(axis="x", rotation=30, labelsize=8, colors=CHART_TEXT)
@@ -262,7 +351,7 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
             return None
 
         for index, col in enumerate(instruction.columns):
-            numeric_required = instruction.type in ["histogram", "boxplot", "scatter"] or (instruction.type == "bar" and len(instruction.columns) == 2 and index == 1) or (instruction.type == "line" and index == 1)
+            numeric_required = instruction.type in ["histogram", "boxplot", "scatter"] or (instruction.type in {"bar", "horizontal_bar"} and len(instruction.columns) == 2 and index == 1) or (instruction.type in {"line", "area"} and index == 1)
             if numeric_required and not pd.api.types.is_numeric_dtype(df[col]):
                 logger.warning(
                     f"Skipping chart {instruction.type}: Column '{col}' is not numeric for numeric plot type. Instruction: {instruction.model_dump_json()}")
@@ -288,7 +377,7 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
             else:
                 plt.close(fig)
                 return None
-        elif instruction.type == "bar":
+        elif instruction.type in {"bar", "horizontal_bar"}:
             if len(instruction.columns) == 2:
                 x_col, y_col = instruction.columns[0], instruction.columns[1]
                 chart_data = df[[x_col, y_col]].dropna()
@@ -297,8 +386,12 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
                     logger.warning("Skipping bar chart without at least two distinct plotted values: %s", instruction.columns)
                     plt.close(fig)
                     return None
-                sns.barplot(x=x_col, y=y_col, data=chart_data, ax=ax, color=CHART_NAVY, errorbar=None)
-                chart_code_str = f"sns.barplot(x='{x_col}', y='{y_col}', data=df, ax=ax)"
+                if instruction.type == "horizontal_bar":
+                    sns.barplot(y=x_col, x=y_col, data=chart_data, ax=ax, color=CHART_NAVY, errorbar=None)
+                    chart_code_str = f"sns.barplot(y='{x_col}', x='{y_col}', data=df, ax=ax)"
+                else:
+                    sns.barplot(x=x_col, y=y_col, data=chart_data, ax=ax, color=CHART_NAVY, errorbar=None)
+                    chart_code_str = f"sns.barplot(x='{x_col}', y='{y_col}', data=df, ax=ax)"
             elif len(instruction.columns) == 1:
                 column = instruction.columns[0]
                 if pd.api.types.is_numeric_dtype(df[column]):
@@ -312,14 +405,18 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
                         logger.warning("Skipping count chart without at least two populated groups: %s", column)
                         plt.close(fig)
                         return None
-                    sns.countplot(x=column, data=df, ax=ax, color=CHART_TEAL)
-                    chart_code_str = f"sns.countplot(x='{column}', data=df, ax=ax)"
+                    if instruction.type == "horizontal_bar":
+                        sns.countplot(y=column, data=df, ax=ax, color=CHART_TEAL)
+                        chart_code_str = f"sns.countplot(y='{column}', data=df, ax=ax)"
+                    else:
+                        sns.countplot(x=column, data=df, ax=ax, color=CHART_TEAL)
+                        chart_code_str = f"sns.countplot(x='{column}', data=df, ax=ax)"
             else:
                 logger.warning(
                     f"Bar chart with {len(instruction.columns)} columns not fully supported without more specific instruction: {instruction.model_dump_json()}")
                 plt.close(fig)
                 return None
-        elif instruction.type == "line":
+        elif instruction.type in {"line", "area"}:
             if len(instruction.columns) == 2:
                 x_col, y_col = instruction.columns[0], instruction.columns[1]
                 if _looks_like_date(df[x_col]):
@@ -350,6 +447,8 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
                     x=x_col, y=y_col, data=df_sorted, ax=ax, color=CHART_NAVY,
                     marker="o", markersize=5, linewidth=2.2, errorbar=None,
                 )
+                if instruction.type == "area":
+                    ax.fill_between(df_sorted[x_col], df_sorted[y_col], color=CHART_TEAL, alpha=0.25)
                 chart_code_str = (
                     f"df_temp = df.copy()\n"
                     f"df_temp[{x_col!r}] = to_datetime_series(df_temp[{x_col!r}])\n"
@@ -418,7 +517,7 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
         if instruction.type != "pie":
             ax.grid(axis="y", color=CHART_GRID, linewidth=0.7, alpha=0.85)
             ax.set_axisbelow(True)
-        if instruction.type == "bar":
+        if instruction.type in {"bar", "horizontal_bar"}:
             for container in ax.containers:
                 try:
                     ax.bar_label(container, fmt="{:,.1f}", padding=3, fontsize=8,
@@ -511,32 +610,55 @@ def generate_visuals(state: GraphState) -> GraphState:
 
 
     generated_visuals_list: List[GeneratedVisual] = []
-    seen_evidence = set()
     for result in computed_results:
-        if result.operation not in {"mean_by_group", "count_by_category", "top_n", "trend_over_time"}:
-            continue
-        signature = (result.source_partition, result.operation, tuple(result.columns))
-        if signature in seen_evidence:
-            continue
-        seen_evidence.add(signature)
-        visual_id = f"chart_{request_id}_{len(generated_visuals_list) + 1}"
-        output_file_path = os.path.join(CHART_OUTPUT_DIR, f"{visual_id}.png")
-        chart_code = _generate_chart_from_audited_result(result, output_file_path)
-        if not chart_code:
-            continue
-        description = (
-            f"Diễn biến {result.columns[-1]} theo thời gian."
-            if result.operation == "trend_over_time"
-            else f"So sánh {result.columns[-1]} giữa các nhóm {result.columns[0]}."
-        )
-        generated_visuals_list.append(GeneratedVisual(
-            visual_id=visual_id, type="line" if result.operation == "trend_over_time" else "bar",
-            description=description, file_path=output_file_path,
-            suggested_section=result.source_partition or "Analysis", chart_code=chart_code,
-            evidence_question_ids=[result.question_id],
-        ))
-        if len(generated_visuals_list) >= 6:
-            break
+        plan = result.parameters.get("analysis_plan") or {}
+        chart_type = _chart_type_from_result(result)
+        partition_df = partitions.get(result.source_partition, df)
+        chart_specs = [(None, None)]
+        if plan.get("group_by") and isinstance(result.result, list):
+            dimensions = plan.get("group_by") or []
+            metrics = plan.get("metrics") or []
+            transforms = plan.get("transforms") or []
+            # Multiple independent dimensions must be split by Question Planner;
+            # do not manufacture separate analyses from one cross-tab result here.
+            if metrics and not transforms and len(dimensions) == 1:
+                chart_specs = [(dimension, metric) for dimension in dimensions for metric in metrics]
+        for dimension, metric in chart_specs:
+            visual_id = f"chart_{request_id}_{len(generated_visuals_list) + 1}"
+            output_file_path = os.path.join(CHART_OUTPUT_DIR, f"{visual_id}.png")
+            chart_code = None
+            if plan.get("group_by") and isinstance(result.result, list):
+                chart_code = _generate_chart_from_audited_result(
+                    result, output_file_path, chart_type, dimension, metric
+                )
+            elif chart_type in {"scatter", "histogram", "boxplot"}:
+                metrics = plan.get("metrics") or result.columns
+                required_columns = metrics[:2] if chart_type == "scatter" else metrics[:1]
+                if required_columns:
+                    instruction = VisualGenerationInstruction(
+                        type=chart_type, columns=required_columns,
+                        title=_chart_title_from_result(result),
+                        description=f"Trực quan hóa kết quả cho câu hỏi: {result.question}",
+                        suggested_section=result.source_partition or "Analysis",
+                        evidence_question_ids=[result.question_id],
+                    )
+                    chart_code = generate_chart(partition_df, instruction, output_file_path)
+            if not chart_code:
+                continue
+            is_time_series = bool(plan.get("time_grain")) or result.operation == "trend_over_time"
+            plotted_dimension = dimension or ((plan.get("group_by") or result.columns)[0])
+            plotted_metric = metric or result.columns[-1]
+            description = (
+                f"Diễn biến {plotted_metric} theo thời gian."
+                if is_time_series
+                else f"So sánh {plotted_metric} giữa các nhóm {plotted_dimension}."
+            )
+            generated_visuals_list.append(GeneratedVisual(
+                visual_id=visual_id, type=chart_type,
+                description=description, file_path=output_file_path,
+                suggested_section=result.source_partition or "Analysis", chart_code=chart_code,
+                evidence_question_ids=[result.question_id],
+            ))
     if generated_visuals_list:
         state["generated_visuals"] = generated_visuals_list
         state["status"] = "visuals_generated"
@@ -550,9 +672,7 @@ def generate_visuals(state: GraphState) -> GraphState:
             partition_results = [item for item in computed_results
                                  if item.source_partition == partition_name]
             instructions_for_partition = _suggestions_from_results(partition_df, partition_results)
-            for instruction in instructions_for_partition[:4]:
-                if visual_index >= 6:
-                    break
+            for instruction in instructions_for_partition:
                 visual_index += 1
                 visual_id = f"chart_{request_id}_{visual_index}"
                 output_file_path = os.path.join(CHART_OUTPUT_DIR, f"{visual_id}.png")
@@ -565,8 +685,6 @@ def generate_visuals(state: GraphState) -> GraphState:
                         suggested_section=partition_name, chart_code=chart_code,
                         evidence_question_ids=instruction.evidence_question_ids,
                     ))
-            if visual_index >= 6:
-                break
         state['generated_visuals'] = generated_visuals_list
         state['status'] = "visuals_generated"
         return state
@@ -589,8 +707,9 @@ def generate_visuals(state: GraphState) -> GraphState:
                 sản phẩm hoặc lợi nhuận nếu dữ liệu không thể hiện những khái niệm đó.
 
                 Với mỗi đề xuất, cung cấp:
-                - `type`: Dùng 'bar' cho so sánh và 'line' cho xu hướng. Chỉ dùng 'pie' khi thể hiện
-                  tỷ trọng của một số ít nhóm.
+                - `type`: Chọn theo mục đích: line cho xu hướng, area cho tích lũy, bar hoặc
+                  horizontal_bar cho so sánh, pie cho tỷ trọng ít nhóm, scatter cho quan hệ hai
+                  biến số, histogram cho phân phối và boxplot cho độ phân tán/ngoại lệ.
                 - `columns`: Danh sách 1 hoặc 2 tên cột chính xác trong dữ liệu. Cột phải tồn tại và
                   phù hợp với loại biểu đồ. Với xu hướng thời gian, cột đầu là thời gian và cột sau là số.
                   Với biểu đồ cột một biến phân loại, hệ thống sẽ đếm số bản ghi.
@@ -610,9 +729,10 @@ def generate_visuals(state: GraphState) -> GraphState:
                 Các insight đã được xác thực trước khi chọn biểu đồ: {insights}
                 Các câu hỏi/kết quả pandas đã chọn: {computed_results}
 
-                Đề xuất 2-6 biểu đồ có giá trị. Ưu tiên dễ hiểu hơn kỹ thuật phức tạp.
+                Đề xuất một biểu đồ cho mọi câu hỏi/kết quả có thể trực quan hóa hữu ích. Không đặt
+                quota tối thiểu hoặc tối đa; không bỏ biểu đồ chỉ vì đã có nhiều biểu đồ khác.
                 Nếu tồn tại ít nhất một tổ hợp cột hợp lệ, bắt buộc đề xuất biểu đồ thay vì trả danh sách rỗng.
-                Không dùng scatter, histogram, boxplot, heatmap hoặc biểu đồ chuyên biệt.
+                Đa dạng loại biểu đồ nhưng không dùng loại phức tạp khi bar/line truyền đạt rõ hơn.
                 Cân nhắc kiểu dữ liệu và phân phối; nếu một cột giống thời gian, có thể đề xuất biểu đồ xu hướng.
                 Không đổi, dịch hoặc tự suy ra mốc thời gian; biểu đồ phải sử dụng trực tiếp cột thời gian đã cho.
                 Tên cột phải khớp chính xác với `column_details_json`.

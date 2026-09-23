@@ -1,5 +1,5 @@
 from typing import List, NotRequired, Optional, TypedDict
-from schemas.messages import (DataProfile, AnalysisInsight, GeneratedVisual, ReportSectionsDraft,
+from schemas.messages import (DataProfile, AnalysisCoverageMap, AnalysisInsight, GeneratedVisual, ReportSectionsDraft,
                               ReportFormat, UserFeedback, FramedQuestion, ComputedQuestionResult, ReportPlan)
 
 class GraphState(TypedDict):
@@ -8,6 +8,7 @@ class GraphState(TypedDict):
     instructions: str
     dataframe_profile: Optional[DataProfile]
     framed_questions: NotRequired[List[FramedQuestion]]
+    analysis_coverage_map: NotRequired[AnalysisCoverageMap]
     computed_question_results: NotRequired[List[ComputedQuestionResult]]
     analysis_insights: Optional[List[AnalysisInsight]]
     validated_insights: NotRequired[List[AnalysisInsight]]
@@ -28,3 +29,4 @@ class GraphState(TypedDict):
     workbook_instruction_context: NotRequired[str]
     analysis_partitions: NotRequired[List[str]]
     sheet_profiles: NotRequired[dict[str, dict[str, object]]]
+    data_scope_profiles: NotRequired[dict[str, dict[str, object]]]

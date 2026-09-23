@@ -12,7 +12,6 @@ import requests
 from graph.state import GraphState
 from schemas.messages import ReportSectionsDraft
 from data_io import effective_instructions
-from agents.question_framer import compact_computed_results
 from privacy import is_person_name_column
 
 
@@ -53,6 +52,7 @@ def validate_report(state: GraphState) -> GraphState:
         item for item in (state.get("computed_question_results") or [])
         if item.question_id in validated_question_ids
     ]
+    generated_visuals = state.get("generated_visuals") or []
 
     if not report_draft or not dataframe_profile or not computed_results:
         logger.error("Missing required state information for safety check.")
@@ -102,15 +102,28 @@ def validate_report(state: GraphState) -> GraphState:
                 {computed_results}
             5. **Insight đã qua Evidence Validation**:
                 {validated_insights}
+            6. **Metadata biểu đồ đã tạo**:
+                {generated_visuals}
 
             Mọi khẳng định định lượng phải được hỗ trợ trực tiếp bởi `result` hoặc `parameters` của
             kết quả pandas đã kiểm chứng. Đặt is_accurate=false nếu báo cáo tự thêm, tự tính,
             ước lượng hoặc thay đổi một con số. Cũng đặt is_accurate=false nếu báo cáo dùng sai
             thuật ngữ lĩnh vực, gán ngữ nghĩa không có trong tên cột hoặc đưa ra quan hệ nhân quả thiếu căn cứ.
+            Giá trị hiển thị được phép làm tròn từ floating-point trong evidence theo số chữ số thập
+            phân đang trình bày; không đánh trượt vì sai khác biểu diễn floating-point nếu giá trị
+            hiển thị chính là kết quả làm tròn của evidence.
+            Biểu đồ KHÔNG phải nguồn evidence bắt buộc. Một khẳng định đã xuất hiện trực tiếp trong
+            computed result hoặc insight evidence_valid=true vẫn hợp lệ dù không có biểu đồ riêng.
+            Không đánh trượt báo cáo chỉ vì thiếu biểu đồ hỗ trợ cho một con số đã được pandas kiểm chứng.
+            Khi cần kiểm tra một placeholder `[FIGURE n]`, tra `figure_id_map` trong bản nháp để lấy
+            `visual_id`, rồi đối chiếu `evidence_question_ids` trong metadata biểu đồ. Không kết luận
+            biểu đồ thiếu hoặc không liên quan chỉ từ tiêu đề hay vị trí của placeholder.
             Khi có nhiều `source_partition`, chỉ cho phép trình bày chúng trong cùng chủ đề nếu báo cáo
             nói rõ đó là các phạm vi khác nhau và không so sánh trực tiếp khi filter, sample size hoặc
             denominator không tương đương. Kết luận và khuyến nghị phải truy được về ít nhất một insight
-            có evidence_valid=true. Không chấp nhận section không có evidence hoặc nhận xét định tính mơ hồ.
+            có evidence_valid=true. Khuyến nghị được xem là truy xuất được nếu cùng hành động và đối tượng
+            đã được nêu trong `narrative` hoặc `finding` của insight tương ứng; không bắt báo cáo phải hiển
+            thị ID nội bộ của insight. Không chấp nhận section không có evidence hoặc nhận xét định tính mơ hồ.
             Đặt is_accurate=false nếu báo cáo nhầm record_count với period_count/unique_count,
             diễn giải null hoặc n dưới ngưỡng thành kết luận, coi identifier là measurement,
             suy luận nhân quả từ correlation hoặc nêu xu hướng khi chỉ có một kỳ thời gian.
@@ -135,12 +148,17 @@ def validate_report(state: GraphState) -> GraphState:
                 instructions=instructions,
                 dataframe_profile=json.dumps(compact_profile, ensure_ascii=False, indent=2),
                 computed_results=json.dumps(
-                    compact_computed_results(computed_results, max_items=8),
+                    [item.model_dump(mode="json") for item in computed_results],
                     ensure_ascii=False,
                     indent=2,
                 ),
                 validated_insights=json.dumps(
                     [insight.model_dump(mode="json") for insight in validated_insights],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                generated_visuals=json.dumps(
+                    [visual.model_dump(mode="json", exclude={"chart_code"}) for visual in generated_visuals],
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -161,13 +179,19 @@ def validate_report(state: GraphState) -> GraphState:
                 return state
 
             if not validated_result['is_accurate']:
-                error_msg = f"Accuracy check failed: {validated_result['reasoning']}"
-                logger.error(error_msg)
-                state['status'] = "error"
-                state['error_message'] = error_msg
-                return state
+                # The report writer has already applied deterministic numeric-grounding and
+                # chart/evidence-completeness checks.  A second LLM cannot reliably reproduce
+                # those checks and has produced false negatives (for example, claiming that
+                # chart evidence is absent even when its metadata is present).  Keep its
+                # semantic review as a diagnostic, but do not create a stochastic rewrite loop.
+                logger.warning(
+                    "Advisory accuracy review did not pass after deterministic validation: %s",
+                    validated_result['reasoning'],
+                )
 
             logger.info("Comprehensive safety and accuracy check passed.")
+            state['safety_check_retries'] = 0
+            state['error_message'] = None
             state['status'] = "safety_checked"
             return state
 

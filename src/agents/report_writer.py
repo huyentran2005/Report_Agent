@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, ValidationError
 from graph.state import GraphState
 from schemas.messages import ReportSectionsDraft
 from data_io import effective_instructions
-from agents.question_framer import compact_computed_results
 from privacy import is_person_name_column
 
 logger = logging.getLogger(__name__)
@@ -23,39 +22,61 @@ class UngroundedNumbersError(ValueError):
     pass
 
 
-def _build_data_quality_text(state, insights):
-    """Build factual scope/quality prose from deterministic profiles, never from the LLM."""
-    profiles = state.get("sheet_profiles") or {}
-    if not profiles:
-        return ""
-    total_rows = sum(int(profile.get("num_rows", 0)) for profile in profiles.values())
-    total_missing = sum(
-        int(detail.get("missing_values_count", 0) or 0)
-        for profile in profiles.values()
-        for detail in (profile.get("column_details") or {}).values()
-    )
-    scopes = []
-    for index, profile in enumerate(profiles.values(), 1):
-        rows = int(profile.get("num_rows", 0))
-        columns = int(profile.get("num_columns", 0))
-        date_ranges = []
-        for detail in (profile.get("column_details") or {}).values():
-            if str(detail.get("type", "")).lower() == "datetime" and detail.get("min") and detail.get("max"):
-                date_ranges.append(f"{detail['min']} đến {detail['max']}")
-        range_text = f", phạm vi thời gian {date_ranges[0]}" if date_ranges else ""
-        scopes.append(f"tập dữ liệu {index}: {rows} bản ghi, {columns} cột{range_text}")
-    sample_sizes = sorted({insight.sample_size for insight in insights if insight.sample_size is not None})
-    warning = ""
-    if len(sample_sizes) > 1:
-        warning = (
-            f" Các phát hiện sử dụng cỡ mẫu khác nhau ({', '.join(map(str, sample_sizes))}); "
-            "không so sánh trực tiếp các giá trị nếu phạm vi hoặc mẫu số không tương đương."
+class IncompleteReportError(ValueError):
+    pass
+
+
+def _report_completeness_issues(report_draft, report_plan, insights, visuals):
+    """Verify that every planned theme has meaningful prose and the correct charts."""
+    if not report_plan:
+        return []
+    issues = []
+    narratives = report_draft.analysis_narratives
+    if len(narratives) != len(report_plan.themes):
+        issues.append(
+            f"có {len(narratives)} narrative nhưng REPORT PLAN có {len(report_plan.themes)} theme"
         )
-    return (
-        f"Báo cáo sử dụng {len(profiles)} tập dữ liệu với tổng cộng {total_rows} bản ghi. "
-        f"Tổng số ô thiếu được ghi nhận là {total_missing}. Phạm vi: {'; '.join(scopes)}."
-        f"{warning} Mỗi kết luận chỉ áp dụng cho nguồn, cột và phạm vi nêu trong evidence tương ứng."
-    )
+    insight_by_id = {item.insight_id: item for item in insights}
+    visual_by_id = {item.visual_id: item for item in visuals or []}
+    mapped_ids = []
+    generic_titles = {"tiêu đề phát hiện", "phân tích biểu đồ", "finding", "chart analysis"}
+    for index, theme in enumerate(report_plan.themes):
+        if index >= len(narratives):
+            issues.append(f"thiếu narrative cho theme {theme.title!r}")
+            continue
+        narrative = narratives[index]
+        title, separator, body = narrative.partition(":-")
+        if not separator or title.strip().casefold() in generic_titles or len(body.strip()) < 60:
+            issues.append(f"narrative của theme {theme.title!r} thiếu tiêu đề/nội dung phân tích")
+        theme_question_ids = {
+            question_id
+            for insight_id in theme.insight_ids
+            if (insight := insight_by_id.get(insight_id))
+            for question_id in insight.evidence_question_ids
+        }
+        placeholders = re.findall(r"\[FIGURE\s+(\d+)\]", narrative, flags=re.IGNORECASE)
+        narrative_visual_ids = {
+            report_draft.figure_id_map.get(f"[FIGURE {number}]") for number in placeholders
+        } - {None}
+        mapped_ids.extend(narrative_visual_ids)
+        wrong = [
+            visual_id for visual_id in narrative_visual_ids
+            if visual_id not in visual_by_id
+            or not theme_question_ids.intersection(visual_by_id[visual_id].evidence_question_ids)
+        ]
+        if wrong:
+            issues.append(f"theme {theme.title!r} chứa biểu đồ không cùng evidence: {wrong}")
+        expected = {
+            visual.visual_id for visual in visuals or []
+            if theme_question_ids.intersection(visual.evidence_question_ids)
+        }
+        missing = expected - narrative_visual_ids
+        if missing:
+            issues.append(f"theme {theme.title!r} thiếu biểu đồ: {sorted(missing)}")
+    duplicate_ids = sorted({item for item in mapped_ids if mapped_ids.count(item) > 1})
+    if duplicate_ids:
+        issues.append(f"biểu đồ bị gắn vào nhiều narrative: {duplicate_ids}")
+    return issues
 
 
 def _strip_source_names_from_headings(report_draft, file_path, partitions):
@@ -116,7 +137,9 @@ def _matches_audited_value(displayed, decimal_places, source):
     return abs(displayed - source) <= tolerance
 
 
-def _unsupported_report_numbers(report_draft, computed_results):
+def _unsupported_report_numbers(
+    report_draft, computed_results, validated_insights, dataframe_profile
+):
 
 
     def allowed_numbers(results):
@@ -134,6 +157,20 @@ def _unsupported_report_numbers(report_draft, computed_results):
         ]
 
     allowed = allowed_numbers(computed_results)
+    allowed.extend(
+        number
+        for insight in validated_insights
+        for number in _numeric_tokens({
+            "metrics": insight.metrics,
+            "sample_size": insight.sample_size,
+            "denominator": insight.denominator,
+            "missing_values": insight.missing_values,
+        })
+    )
+    allowed.extend(_numeric_tokens({
+        "num_rows": dataframe_profile.num_rows,
+        "num_columns": dataframe_profile.num_columns,
+    }))
     global_text = "\n".join([
         report_draft.dataset_title,
         report_draft.introduction_text,
@@ -147,68 +184,6 @@ def _unsupported_report_numbers(report_draft, computed_results):
     for narrative in report_draft.analysis_narratives:
         unsupported.extend(unsupported_in_text(narrative, allowed))
     return unsupported
-
-
-def _unsupported_report_numbers_by_field(report_draft, computed_results):
-    """Return field-level diagnostics for the grounding invariant."""
-    allowed = [
-        number for item in computed_results
-        for number in (*_numeric_tokens(item.result), *_numeric_tokens(item.parameters),
-                       *_numeric_tokens(item.columns), *_numeric_tokens(item.source_partition))
-    ]
-
-    def unsupported(text):
-        clean_text = re.sub(r"\[FIGURE\s+\d+\]", "", text, flags=re.IGNORECASE)
-        return [
-            number for number, decimals in _displayed_numbers(clean_text)
-            if not any(_matches_audited_value(number, decimals, source) for source in allowed)
-        ]
-
-    fields = {
-        "dataset_title": [report_draft.dataset_title],
-        "introduction_text": [report_draft.introduction_text],
-        "data_quality_text": [report_draft.data_quality_text],
-        "analysis_narratives": report_draft.analysis_narratives,
-        "key_takeaways_bullet_points": report_draft.key_takeaways_bullet_points,
-        "notable_issues": report_draft.notable_issues,
-        "conclusion_text": [report_draft.conclusion_text],
-        "clarification_questions": report_draft.clarification_questions,
-    }
-    return {
-        name: numbers
-        for name, values in fields.items()
-        if (numbers := [number for value in values for number in unsupported(value)])
-    }
-
-
-def _safe_grounded_fallback(report_draft):
-    """Guarantee a usable number-free draft if deterministic cleanup ever violates its invariant."""
-    return ReportSectionsDraft(
-        dataset_title="Báo cáo dữ liệu",
-        introduction_text="Báo cáo tổng hợp thông tin từ dữ liệu đã cung cấp theo yêu cầu của người dùng.",
-        data_quality_text="Chất lượng dữ liệu được đánh giá trong phạm vi thông tin có thể kiểm chứng.",
-        analysis_narratives=[],
-        key_takeaways_bullet_points=[],
-        notable_issues=[],
-        conclusion_text="Báo cáo chỉ trình bày những kết luận có căn cứ từ dữ liệu được cung cấp.",
-        figure_id_map=report_draft.figure_id_map,
-        clarification_questions=[],
-    )
-
-
-def _remove_unsupported_sentences(text, allowed):
-    """Remove complete clauses containing ungrounded numbers; never invent replacements."""
-    parts = re.split(r"(?<=[.!?;])\s+|\n+", text)
-    kept = []
-    for part in parts:
-        clean_part = re.sub(r"\[FIGURE\s+\d+\]", "", part, flags=re.IGNORECASE)
-        unsupported = [
-            number for number, decimals in _displayed_numbers(clean_part)
-            if not any(_matches_audited_value(number, decimals, source) for source in allowed)
-        ]
-        if not unsupported:
-            kept.append(part.strip())
-    return " ".join(filter(None, kept)).strip()
 
 
 def _remove_generic_caveats(text: str) -> str:
@@ -246,55 +221,6 @@ def _sanitize_generic_caveats(report_draft):
         if (cleaned := _remove_generic_caveats(item))
     ]
     return report_draft
-
-
-def _sanitize_ungrounded_numbers(report_draft, computed_results):
-    """Deterministic last-resort cleanup that preserves only traceable quantitative claims."""
-    def allowed_numbers(results):
-        return [
-            number for item in results
-            for number in (*_numeric_tokens(item.result), *_numeric_tokens(item.parameters),
-                           *_numeric_tokens(item.columns), *_numeric_tokens(item.source_partition))
-        ]
-
-    global_allowed = allowed_numbers(computed_results)
-    cleaned_title = _remove_unsupported_sentences(report_draft.dataset_title, global_allowed)
-    report_draft.dataset_title = cleaned_title or "Báo cáo dữ liệu"
-    report_draft.introduction_text = _remove_unsupported_sentences(
-        report_draft.introduction_text, global_allowed
-    ) or "Báo cáo tổng hợp thông tin có thể kiểm chứng từ dữ liệu đã cung cấp."
-    report_draft.data_quality_text = _remove_unsupported_sentences(
-        report_draft.data_quality_text, global_allowed
-    )
-    report_draft.conclusion_text = _remove_unsupported_sentences(
-        report_draft.conclusion_text, global_allowed
-    ) or "Báo cáo chỉ trình bày những kết luận có căn cứ từ dữ liệu được cung cấp."
-    report_draft.key_takeaways_bullet_points = [
-        cleaned for bullet in report_draft.key_takeaways_bullet_points
-        if (cleaned := _remove_unsupported_sentences(bullet, global_allowed))
-    ]
-    report_draft.notable_issues = [
-        cleaned for issue in report_draft.notable_issues
-        if (cleaned := _remove_unsupported_sentences(issue, global_allowed))
-    ]
-    report_draft.clarification_questions = [
-        cleaned for question in report_draft.clarification_questions
-        if (cleaned := _remove_unsupported_sentences(question, global_allowed))
-    ]
-    sanitized_narratives = []
-    for narrative in report_draft.analysis_narratives:
-        title, separator, body = narrative.partition(":-")
-        cleaned_title = _remove_unsupported_sentences(title, global_allowed)
-        cleaned_body = _remove_unsupported_sentences(body if separator else narrative, global_allowed)
-        if cleaned_body:
-            cleaned_title = cleaned_title or "Phát hiện có bằng chứng"
-            sanitized_narratives.append(
-                f"{cleaned_title}:-{cleaned_body}" if separator else cleaned_body
-            )
-    report_draft.analysis_narratives = sanitized_narratives
-    return report_draft
-
-
 
 
 def draft_report(state: GraphState) -> GraphState:
@@ -356,7 +282,11 @@ def draft_report(state: GraphState) -> GraphState:
     if dataframe_profile:
 
 
-        profile_summary = "Schema dữ liệu (chỉ gồm tên cột và kiểu dữ liệu):\n"
+        profile_summary = (
+            f"Số bản ghi đã kiểm chứng: {dataframe_profile.num_rows}\n"
+            f"Số cột đã kiểm chứng: {dataframe_profile.num_columns}\n"
+            "Schema dữ liệu (chỉ gồm tên cột và kiểu dữ liệu):\n"
+        )
         sheets = state.get("workbook_sheets") or []
         if sheets:
             sheet_schema = [
@@ -401,13 +331,15 @@ def draft_report(state: GraphState) -> GraphState:
         for i, visual in enumerate(generated_visuals):
             visuals_context += f"ID biểu đồ: {visual.visual_id}\n"
             visuals_context += f"Mô tả: {visual.description}\n"
+            visuals_context += f"Evidence question IDs: {visual.evidence_question_ids}\n"
             visuals_context += "---\n"
             visual_reference_for_llm.append({
                 "visual_id": visual.visual_id,
-                "description": visual.description
+                "description": visual.description,
+                "evidence_question_ids": visual.evidence_question_ids,
             })
     computed_facts = json.dumps(
-        compact_computed_results(computed_results, max_items=8), ensure_ascii=False, indent=2
+        [item.model_dump(mode="json") for item in computed_results], ensure_ascii=False, indent=2
     )
     report_plan = state.get("report_plan")
     report_plan_context = (
@@ -418,7 +350,7 @@ def draft_report(state: GraphState) -> GraphState:
     base_delay = 2
     llm_raw_output_str = ""
     report_draft = None
-    grounding_feedback = "Chưa có bản nháp nào bị từ chối."
+    grounding_feedback = state.get("error_message") or "Chưa có bản nháp nào bị từ chối."
 
     for attempt in range(max_retries):
         try:
@@ -438,13 +370,18 @@ def draft_report(state: GraphState) -> GraphState:
 
                 Quy tắc căn cứ định lượng:
                 - KẾT QUẢ PANDAS ĐÃ KIỂM CHỨNG là nguồn duy nhất cho mọi con số trong phần diễn giải.
+                  Các trường audit của insight evidence_valid=true (`metrics`, `sample_size`,
+                  `denominator`, `missing_values`) cũng hợp lệ vì được Evidence Validator dẫn xuất
+                  trực tiếp từ chính kết quả pandas.
                 - Không tự tính, ước lượng, ngoại suy hoặc thêm số không có trong `result` hay `parameters`.
                 - Có thể làm tròn giá trị đã có để dễ đọc nhưng không được tạo ra giá trị mới.
                 - Không cộng/trừ các kết quả, không tính tỷ trọng/chênh lệch và không đổi số thập phân
                   sang phần trăm nếu giá trị chuyển đổi không xuất hiện trực tiếp trong kết quả pandas.
                 - Mọi ngày, tháng, năm và kỳ thời gian phải khớp chính xác chuỗi thời gian trong
                   kết quả pandas; không tự dịch mốc, đổi kỳ, nội suy hoặc bổ sung khoảng thời gian.
-                - Profile, phát hiện và mô tả biểu đồ chỉ là ngữ cảnh, không phải nguồn số liệu bổ sung.
+                - Văn bản profile, văn bản phát hiện và mô tả biểu đồ chỉ là ngữ cảnh, không phải
+                  nguồn số liệu bổ sung. Chỉ `num_rows`, `num_columns` của profile và các trường audit
+                  của insight nêu trên được dùng làm evidence định lượng.
                 - Không biến null, n=0 hoặc n=1 thành một kết luận. Khi evidence không đủ, ghi đúng
                   "Không đủ dữ liệu để đánh giá." và không suy diễn thêm.
                 - Phân biệt record_count, period_count và unique_count; không gọi một kỳ thời gian
@@ -457,14 +394,19 @@ def draft_report(state: GraphState) -> GraphState:
                   không chứa tên file, tên sheet hoặc metadata nội bộ.
                 - `introduction_text`: Giới thiệu mục tiêu, phạm vi dữ liệu và nội dung người đọc sẽ nhận được;
                   không thêm thông tin nền không có trong dữ liệu.
-                - `data_quality_text`: Chất lượng, phạm vi và giới hạn dữ liệu; để chuỗi rỗng nếu
-                  kết quả pandas không cung cấp đủ bằng chứng để viết phần này.
+                - `data_quality_text`: Luôn trả về chuỗi rỗng; báo cáo không có mục chất lượng dữ liệu riêng.
                 - `analysis_narratives`: Danh sách đoạn phân tích chi tiết. Mỗi đoạn phải có tiêu đề,
                   sau đó là chuỗi `:-` rồi mới đến nội dung. Dùng placeholder `[FIGURE 1]`, `[FIGURE 2]`...
                   theo đúng thứ tự khi nhắc đến biểu đồ.
+                  Mỗi biểu đồ phải được đặt trong narrative của theme/insight có cùng evidence và ngay
+                  cạnh placeholder phải có nhận xét giải thích biểu đồ thể hiện điều gì, bằng chứng nào
+                  nổi bật và hàm ý gì. Không tạo mục trực quan hóa bổ sung tách khỏi nội dung phân tích.
                   Tiêu đề phải có dạng `Tiêu đề phát hiện:-Nội dung`. Tuyệt đối không đặt tên file,
                   tên sheet/source_partition hoặc ký tự `|` trong tiêu đề.
                 - `key_takeaways_bullet_points`: Các kết luận hoặc hàm ý ngắn gọn, có thể hành động và phù hợp lĩnh vực.
+                  Chỉ được dùng hành động/khuyến nghị đã xuất hiện trong insight evidence_valid=true;
+                  không tự đề xuất “tập trung”, “tối ưu”, “cải thiện” hoặc chiến lược mới nếu insight
+                  không nêu hành động đó từ evidence tương ứng.
                 - `notable_issues`: Các vấn đề hoặc bất thường đáng chú ý có bằng chứng; để [] nếu không có.
                 - `conclusion_text`: Kết luận tổng hợp và bước tiếp theo hợp lý. Chỉ nêu giới hạn nếu
                   context có một giới hạn cụ thể đã kiểm chứng.
@@ -499,6 +441,10 @@ def draft_report(state: GraphState) -> GraphState:
                   không có limitation cụ thể trong context, kết thúc đoạn sau hàm ý hoặc hành động.
                 - Tổ chức analysis_narratives theo đúng analytical themes trong REPORT PLAN; gộp các
                   insight cùng theme thành một narrative thay vì tạo section cho từng câu hỏi nhỏ.
+                  Bắt buộc tạo đủ một narrative cho MỌI theme trong REPORT PLAN và đưa nội dung của
+                  MỌI insight evidence_valid=true vào đúng narrative; không bỏ bớt vì nội dung dài
+                  hoặc vì insight khác có chủ đề gần giống. Khi đã có biểu đồ cho evidence, diễn giải
+                  bằng biểu đồ và nhận xét, không yêu cầu lặp lại cùng evidence dưới dạng bảng.
                 - Phần mở đầu đóng vai trò executive summary, dài tối đa một đoạn ngắn: nêu quy mô,
                   kết quả nổi bật, bất thường và phạm vi thời gian bằng số cụ thể có trong evidence.
                   Bảng và biểu đồ sẽ được exporter dựng từ REPORT PLAN; không tự tính lại số liệu.
@@ -539,7 +485,8 @@ def draft_report(state: GraphState) -> GraphState:
 
                 ---
                 Hãy tạo bản nháp báo cáo đầy đủ. Dùng placeholder `[FIGURE N]` trong phần diễn giải
-                và điền `figure_id_map` chính xác.
+                và điền `figure_id_map` chính xác. MỌI biểu đồ trong danh sách đã tạo phải xuất hiện
+                trong figure_id_map, nằm trong narrative tương ứng và có nhận xét ngay tại đó.
 
                 {format_instructions}
 
@@ -579,45 +526,30 @@ def draft_report(state: GraphState) -> GraphState:
             )
             report_draft = _sanitize_generic_caveats(report_draft)
 
-            unsupported_numbers = _unsupported_report_numbers(report_draft, computed_results)
+            completeness_issues = _report_completeness_issues(
+                report_draft, report_plan, analysis_insights, generated_visuals
+            )
+            if completeness_issues:
+                raise IncompleteReportError("; ".join(completeness_issues))
+
+            unsupported_numbers = _unsupported_report_numbers(
+                report_draft, computed_results, analysis_insights, dataframe_profile
+            )
             if unsupported_numbers:
-                if attempt == max_retries - 1:
-                    logger.warning(
-                        "Applying deterministic cleanup to ungrounded numbers after final attempt: %s",
-                        unsupported_numbers,
-                    )
-                    report_draft = _sanitize_ungrounded_numbers(report_draft, computed_results)
-                    remaining = _unsupported_report_numbers(report_draft, computed_results)
-                    if remaining:
-                        diagnostics = _unsupported_report_numbers_by_field(
-                            report_draft, computed_results
-                        )
-                        logger.error(
-                            "Grounding cleanup invariant failed by field: %s. "
-                            "Replacing prose with the safe grounded fallback.", diagnostics,
-                        )
-                        report_draft = _safe_grounded_fallback(report_draft)
-                        remaining = _unsupported_report_numbers(report_draft, computed_results)
-                        if remaining:
-                            raise UngroundedNumbersError(
-                                "Không thể bảo đảm căn cứ định lượng sau bước fallback an toàn: "
-                                f"{remaining}"
-                            )
-                    logger.info("Ungrounded numeric clauses were removed deterministically.")
-                else:
-                    raise UngroundedNumbersError(
-                        f"Báo cáo chứa số không có trong kết quả pandas đã kiểm chứng: {unsupported_numbers}"
-                    )
+                raise UngroundedNumbersError(
+                    f"Báo cáo chứa số không có trong kết quả pandas đã kiểm chứng: {unsupported_numbers}"
+                )
 
             logger.info("LLM returned report draft sections.")
 
             break
 
-        except UngroundedNumbersError as e:
-            logger.warning("Ungrounded report draft on attempt %s/%s: %s", attempt + 1, max_retries, e)
+        except (UngroundedNumbersError, IncompleteReportError) as e:
+            logger.warning("Report draft bị từ chối lần %s/%s: %s", attempt + 1, max_retries, e)
             grounding_feedback = (
-                f"Bản nháp trước bị từ chối: {e}. Hãy loại bỏ các số không có căn cứ đó; "
-                "không thay thế bằng số tự tính mới."
+                f"Bản nháp trước bị từ chối: {e}. Hãy sửa đúng mọi lỗi được nêu, tạo đủ một "
+                "narrative cho từng theme theo đúng thứ tự REPORT PLAN, dùng tiêu đề có nghĩa, "
+                "nhận xét evidence và gắn đúng biểu đồ; không thêm số tự tính mới."
             )
             if attempt == max_retries - 1:
                 state['status'] = "error"
@@ -636,12 +568,26 @@ def draft_report(state: GraphState) -> GraphState:
                 return state
 
         except (json.JSONDecodeError, ValidationError) as e:
-            logger.error(f"Error parsing LLM JSON for report draft for request {request_id}: {e}", exc_info=True)
-            logger.error(f"Raw LLM Output: {llm_raw_output_str[:1000]}...")
-            state['status'] = "error"
-            state[
-                'error_message'] = f"LLM output for report draft was invalid JSON or schema: {e}. Raw LLM Output: {llm_raw_output_str[:1000]}..."
-            return state
+            logger.warning(
+                "Report draft JSON/schema không hợp lệ lần %s/%s cho request %s: %s",
+                attempt + 1,
+                max_retries,
+                request_id,
+                e,
+            )
+            logger.debug("Raw LLM Output: %s", llm_raw_output_str[:1000])
+            grounding_feedback = (
+                f"Bản nháp trước không phải JSON hợp lệ theo schema: {e}. "
+                "Hãy xuất lại duy nhất một đối tượng JSON hợp lệ, không có dấu phẩy thừa, "
+                "không có markdown và giữ đầy đủ nội dung báo cáo theo REPORT PLAN."
+            )
+            if attempt == max_retries - 1:
+                state['status'] = "error"
+                state['error_message'] = (
+                    f"LLM output for report draft remained invalid JSON or schema after "
+                    f"{max_retries} attempts: {e}"
+                )
+                return state
         except Exception as e:
             logger.error(f"An unexpected error occurred during LLM call for report drafting for request {request_id}: {e}",
                          exc_info=True)
@@ -649,11 +595,9 @@ def draft_report(state: GraphState) -> GraphState:
             state['error_message'] = f"An unexpected error occurred during report drafting LLM call: {e}"
             return state
     if report_draft:
-        report_draft.data_quality_text = _build_data_quality_text(state, analysis_insights)
+        report_draft.data_quality_text = ""
         state['report_sections_draft'] = report_draft
-
-
-
+        state['error_message'] = None
         state['status'] = "report_drafted"
 
         logger.info(f"ReportDraftingNode completed for request: {request_id}. Report drafted.")

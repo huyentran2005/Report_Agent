@@ -43,7 +43,10 @@ def display_value(value) -> str:
 
 
 def evidence_table_html(table) -> str:
-    headers = "".join(f"<th>{escape(friendly_label(column))}</th>" for column in table.columns)
+    headers = "".join(
+        f'<th style="color:#FFFFFF !important;">{escape(friendly_label(column))}</th>'
+        for column in table.columns
+    )
     rows = []
     for row in table.rows:
         cells = "".join(

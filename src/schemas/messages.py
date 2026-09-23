@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 
 class DataProfile(BaseModel):
@@ -8,23 +8,153 @@ class DataProfile(BaseModel):
     num_columns: int = Field(description="Number of columns in the dataset.")
     column_details: Dict[str, Dict[str, Any]] = Field(description="Dictionary of column names to their details (e.g., 'type', 'unique_values_count', 'missing_values_count', 'mean', 'std', 'min', 'max').")
     key_observations: str = Field(description="Key observations about the dataset's structure, quality, and potential issues (e.g., missing values, outliers, data types that need conversion).")
+    data_scope: Optional["PartitionDataScope"] = Field(
+        default=None, description="Deterministic scope of the source partition."
+    )
 
 
-AnalysisOperation = Literal[
-    "mean_by_group", "count_by_category", "trend_over_time", "top_n",
-    "missing_rate", "correlation", "distribution_summary", "aggregate_summary",
-]
+class DimensionScope(BaseModel):
+    column: str
+    kind: Literal["time", "category", "geography", "operation", "dimension"]
+    valid_count: int = Field(ge=0)
+    unique_count: int = Field(ge=0)
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    years: List[int] = Field(default_factory=list)
+    periods: List[str] = Field(default_factory=list)
+    values: List[Any] = Field(default_factory=list)
+    values_complete: bool = False
+
+
+class PartitionDataScope(BaseModel):
+    source_partition: str
+    row_count: int = Field(ge=0)
+    dimensions: List[DimensionScope] = Field(default_factory=list)
+
+
+class QuestionDataScope(BaseModel):
+    coverage_mode: Literal["full_dataset", "user_requested_subset", "analytical_subset"] = "full_dataset"
+    source_partitions: List[str] = Field(default_factory=list)
+    time_columns: List[str] = Field(default_factory=list)
+    dimension_columns: List[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
+AnalysisOperation = str
+
+
+class ColumnAnalysisRole(BaseModel):
+    column: str
+    source_partition: str
+    role: Literal[
+        "time", "measure", "outcome", "driver", "category", "geography",
+        "operation", "identifier", "free_text", "sensitive", "exclude",
+    ]
+    include_in_analysis: bool = True
+    rationale: str
+
+
+class AnalyticalTheme(BaseModel):
+    theme_id: str
+    title: str
+    purpose: str
+    source_partition: str
+    columns: List[str]
+    required: bool = True
+    suggested_analyses: List[str] = Field(default_factory=list)
+
+
+class AnalysisCoverageMap(BaseModel):
+    column_roles: List[ColumnAnalysisRole]
+    themes: List[AnalyticalTheme] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_theme_ids(self):
+        theme_ids = [theme.theme_id for theme in self.themes]
+        if len(theme_ids) != len(set(theme_ids)):
+            raise ValueError("Mỗi analytical theme phải có theme_id duy nhất.")
+        return self
+
+
+class AnalysisFilter(BaseModel):
+    column: str
+    operator: Literal[
+        "eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in",
+        "contains", "between", "is_null", "not_null",
+    ]
+    value: Any = None
+
+
+class AnalysisTransform(BaseModel):
+    type: Literal[
+        "pct_change", "difference", "cumulative", "share_of_total",
+        "ratio", "rank", "rolling_mean", "correlation", "distribution",
+        "outlier_iqr", "round",
+    ]
+    column: Optional[str] = None
+    numerator: Optional[str] = None
+    denominator: Optional[str] = None
+    output_column: Optional[str] = None
+    periods: int = Field(default=1, ge=1)
+    window: int = Field(default=3, ge=2)
+    decimals: int = Field(default=2, ge=0, le=10)
+
+
+class AnalysisSort(BaseModel):
+    by: str
+    ascending: bool = True
+
+
+class StructuredAnalysisPlan(BaseModel):
+    """Declarative analysis plan compiled by the generic Pandas executor."""
+
+    source_partition: str
+    group_by: List[str] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    aggregation: Literal["sum", "mean", "count", "median", "min", "max", "std", "nunique"] = "sum"
+    time_grain: Optional[Literal["day", "week", "month", "quarter", "year"]] = None
+    filters: List[AnalysisFilter] = Field(default_factory=list)
+    transforms: List[AnalysisTransform] = Field(default_factory=list)
+    sort: Optional[AnalysisSort] = None
+    limit: Optional[int] = Field(default=None, ge=1)
+    dropna: bool = True
+    include_sample_size: bool = True
+
+    @field_validator("sort", mode="before")
+    @classmethod
+    def normalize_empty_sort(cls, value):
+        """Treat an empty LLM sort object as an omitted optional sort specification."""
+        if value is None or value == {}:
+            return None
+        if isinstance(value, str) and value.strip().casefold() in {"", "null", "none", "n/a"}:
+            return None
+        return value
 
 
 class FramedQuestion(BaseModel):
     question_id: str = Field(description="Stable identifier such as question_1.")
     question: str = Field(description="The report question to answer.")
-    operation: AnalysisOperation = Field(description="A supported, pre-defined pandas operation.")
-    columns: List[str] = Field(description="Exact dataset column names, in operation-specific order.")
-    aggregation: Literal["sum", "mean", "count"] = Field(
-        default="sum", description="Aggregation used by trend_over_time and top_n."
+    operation: AnalysisOperation = Field(default="structured_plan", description="Reader-facing analysis label.")
+    columns: List[str] = Field(default_factory=list, description="Exact source columns used by the plan.")
+    analysis_type: Optional[str] = Field(default=None, description="Reader-facing analysis category.")
+    expected_result: str = Field(
+        min_length=1,
+        description="Required reader-facing description of the expected result and its meaning.",
     )
-    n: int = Field(default=5, ge=1, le=20, description="Number of rows returned by top_n.")
+    visualization: Optional[str] = Field(default=None, description="Suggested visualization type, if useful.")
+    theme_ids: List[str] = Field(
+        min_length=1,
+        description="Analytical themes from the coverage map that this question covers.",
+    )
+    scope: QuestionDataScope = Field(
+        default_factory=QuestionDataScope,
+        description="Explicit input-data scope; full_dataset is the default.",
+    )
+    depends_on_question_ids: List[str] = Field(
+        default_factory=list,
+        description="Questions whose computed results must be observed before this question is planned/executed.",
+    )
+    plan: StructuredAnalysisPlan
     source_partition: Optional[str] = Field(default=None, description="Sheet or compatible sheet group to analyze.")
 
 
@@ -100,7 +230,7 @@ class ReportPlan(BaseModel):
 
 class VisualGenerationInstruction(BaseModel):
     
-    type: str = Field(description="Reader-friendly chart type: 'bar' or 'line'.")
+    type: str = Field(description="Reader-friendly chart type such as bar, horizontal_bar, line, area, pie, scatter, histogram, or boxplot.")
     columns: List[str] = Field(description="List of column names to be used for the chart.")
     title: Optional[str] = Field(default=None, description="Title for the chart.")
     description: str = Field(description="A brief explanation of what the chart should convey or highlight.")
@@ -109,7 +239,7 @@ class VisualGenerationInstruction(BaseModel):
 
 class GeneratedVisual(BaseModel):
     visual_id: str = Field(description="Unique identifier for the generated visual.")
-    type: str = Field(description="Reader-friendly chart type: 'bar' or 'line'.")
+    type: str = Field(description="Reader-friendly chart type used for the generated visual.")
     description: str = Field(description="Description of what the visual depicts.")
     file_path: str = Field(description="Local file path where the generated chart image is saved.")
     suggested_section: str = Field(description="Suggested section in the report where this visual should be placed.")

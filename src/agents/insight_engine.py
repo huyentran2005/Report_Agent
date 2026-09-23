@@ -10,7 +10,6 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, Field, ValidationError
 
-from agents.question_framer import compact_computed_results
 from data_io import effective_instructions
 from graph.state import GraphState
 from llm import get_llm, text_from_response
@@ -26,10 +25,11 @@ class GeneratedInsightsOutput(BaseModel):
 
 def _results_by_partition(results, analysis_partitions=None) -> Dict[str, list]:
     """Keep every LLM request scoped to one source sheet/partition."""
-    default_partition = (analysis_partitions or ["Dữ liệu"])[0]
     grouped: Dict[str, list] = OrderedDict()
     for item in results:
-        grouped.setdefault(item.source_partition or default_partition, []).append(item)
+        if not item.source_partition:
+            raise ValueError(f"Computed result {item.question_id} thiếu source_partition.")
+        grouped.setdefault(item.source_partition, []).append(item)
     return grouped
 
 
@@ -68,7 +68,8 @@ def _visuals_context(visuals, partition: str) -> str:
         return "Không có biểu đồ dành riêng cho phần dữ liệu này."
     return "\n".join(
         ["Các biểu đồ của phần dữ liệu này:"]
-        + [f"- ID={v.visual_id}; loại={v.type}; mô tả={v.description}; tệp={v.file_path}"
+        + [f"- ID={v.visual_id}; loại={v.type}; mô tả={v.description}; "
+           f"evidence_question_ids={v.evidence_question_ids}; tệp={v.file_path}"
            for v in selected]
     )
 
@@ -110,8 +111,10 @@ tương quan. Với thời gian, chỉ nhận xét xu hướng khi có ít nhấ
 khi chỉ có 2 kỳ; ưu tiên kết luận xu hướng khi có từ 3 kỳ.
 
 Mỗi phát hiện gồm insight_id, title, finding, narrative, limitations,
-supporting_visual_ids và source_partition.
-Luôn đặt source_partition chính xác là `{partition}`. Tạo 1-2 phát hiện khác biệt; nêu bằng
+supporting_visual_ids, evidence_question_ids và source_partition.
+Luôn đặt source_partition chính xác là `{partition}`. Bắt buộc tạo đúng MỘT insight cho MỖI
+question_id trong KẾT QUẢ PANDAS. Mỗi insight chỉ được khai báo đúng một evidence_question_id;
+không gộp câu hỏi thời gian, khu vực, sản phẩm, danh mục hoặc vận chuyển vào cùng insight. Nêu bằng
 chứng, ý nghĩa và chỉ dẫn biểu đồ thực sự hỗ trợ. `limitations` để [] trừ khi nguồn cho thấy
 một giới hạn cụ thể như thiếu dữ liệu, cỡ mẫu/mẫu số không tương đương hoặc quá ít kỳ quan sát.
 Narrative theo logic: Phát hiện → Bằng chứng số liệu → Ý nghĩa kinh doanh/chuyên môn → Hành động
@@ -157,7 +160,7 @@ Chỉ trả về JSON hợp lệ.
             "profile_summary": _profile_summary(state, partition),
             "visuals_context": _visuals_context(state.get("generated_visuals"), partition),
             "computed_facts": json.dumps(
-                compact_computed_results(results, max_items=8), ensure_ascii=False, indent=2
+                [item.model_dump(mode="json") for item in results], ensure_ascii=False, indent=2
             ),
             "instructions": instructions,
         }
@@ -172,6 +175,22 @@ Chỉ trả về JSON hợp lệ.
                 if raw.startswith("```json") and raw.endswith("```"):
                     raw = raw[len("```json"):-len("```")].strip()
                 parsed = GeneratedInsightsOutput.model_validate_json(raw)
+                available_ids = {item.question_id for item in results}
+                returned_ids = [
+                    insight.evidence_question_ids[0]
+                    for insight in parsed.insights
+                    if len(insight.evidence_question_ids) == 1
+                ]
+                invalid = [
+                    insight.insight_id for insight in parsed.insights
+                    if len(insight.evidence_question_ids) != 1
+                    or insight.evidence_question_ids[0] not in available_ids
+                ]
+                if invalid or set(returned_ids) != available_ids or len(returned_ids) != len(available_ids):
+                    raise ValueError(
+                        "Mỗi question_id phải có đúng một insight riêng; "
+                        f"expected={sorted(available_ids)}, returned={returned_ids}, invalid={invalid}"
+                    )
                 break
             except (requests.exceptions.RequestException, TimeoutError) as exc:
                 if attempt == 2:
@@ -179,7 +198,7 @@ Chỉ trả về JSON hợp lệ.
                     state["error_message"] = f"Không thể tạo insight cho sheet '{partition}' sau 3 lần thử: {exc}"
                     return state
                 time.sleep(2 * (2 ** attempt))
-            except (json.JSONDecodeError, ValidationError) as exc:
+            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 logger.error("Invalid insight JSON for %r: %s; raw=%s", partition, exc, raw[:500])
                 if attempt == 2:
                     state["status"] = "error"
@@ -192,23 +211,26 @@ Chỉ trả về JSON hợp lệ.
                 state["error_message"] = f"Không thể tạo insight cho sheet '{partition}': {exc}"
                 return state
         if parsed:
-            valid_visual_ids = {
-                visual.visual_id for visual in (state.get("generated_visuals") or [])
-                if visual.suggested_section == partition
-                or visual.description.startswith(f"[{partition}]")
-            }
+            result_by_id = {item.question_id: item for item in results}
             for insight in parsed.insights:
+                linked_results = [result_by_id[insight.evidence_question_ids[0]]]
                 insight.source_partition = partition
                 insight.insight_id = f"insight_{len(generated) + 1}"
-                insight.evidence_question_ids = [item.question_id for item in results]
-                insight.question = " | ".join(item.question for item in results)
+                insight.question = linked_results[0].question
                 insight.finding = insight.finding or insight.title
                 insight.source_sheet = partition
                 insight.source_columns = list(dict.fromkeys(
-                    column for item in results for column in item.columns
+                    column for item in linked_results for column in item.columns
                 ))
-                insight.metrics = {item.question_id: item.result for item in results}
+                insight.metrics = {
+                    linked_results[0].question_id: linked_results[0].result
+                }
                 insight.evidence_valid = False
+                linked_question_ids = set(insight.evidence_question_ids)
+                valid_visual_ids = {
+                    visual.visual_id for visual in (state.get("generated_visuals") or [])
+                    if linked_question_ids.intersection(visual.evidence_question_ids)
+                }
                 insight.supporting_visual_ids = [
                     visual_id for visual_id in insight.supporting_visual_ids
                     if visual_id in valid_visual_ids
