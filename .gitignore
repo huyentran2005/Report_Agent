@@ -1,2 +1,5 @@
 .venv/
 .env
+*.cpython-*
+__pycache__/
+local_app_data/
