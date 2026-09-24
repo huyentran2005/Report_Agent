@@ -155,13 +155,21 @@ Chỉ trả về JSON hợp lệ.
     )
     generated: List[AnalysisInsight] = []
     for partition, results in _insight_batches(grouped):
+        compact_facts = []
+        for item in results:
+            payload = item.model_dump(mode="python")
+            if isinstance(payload.get("result"), list) and len(payload["result"]) > 80:
+                payload["result"] = payload["result"][:80]
+                payload["result_truncated"] = True
+            encoded = json.dumps(payload, ensure_ascii=False, default=str)
+            if len(encoded) > 18000:
+                encoded = encoded[:18000] + '..."'
+            compact_facts.append(encoded)
         values = {
             "partition": partition,
             "profile_summary": _profile_summary(state, partition),
             "visuals_context": _visuals_context(state.get("generated_visuals"), partition),
-            "computed_facts": json.dumps(
-                [item.model_dump(mode="json") for item in results], ensure_ascii=False, indent=2
-            ),
+            "computed_facts": "[\n" + ",\n".join(compact_facts)[:90000] + "\n]",
             "instructions": instructions,
         }
         parsed = None

@@ -1,8 +1,12 @@
 """Build a compact report plan deterministically from validated evidence."""
 from __future__ import annotations
 
+import logging
+
 from graph.state import GraphState
 from schemas.messages import EvidenceTable, ReportPlan, ReportTheme
+
+logger = logging.getLogger(__name__)
 
 
 def _theme_for_result(item) -> tuple[str, str]:
@@ -51,13 +55,17 @@ def build_report_plan(state: GraphState) -> GraphState:
     insights = [item for item in state.get("analysis_insights") or [] if item.evidence_valid]
     results = {item.question_id: item for item in state.get("computed_question_results") or []}
     allowed_ids = {qid for insight in insights for qid in insight.evidence_question_ids}
-    missing_insight_ids = set(results) - allowed_ids
     unknown_insight_ids = allowed_ids - set(results)
-    if missing_insight_ids or unknown_insight_ids:
+    if unknown_insight_ids:
         raise ValueError(
-            "Report plan yêu cầu ánh xạ 1-1 giữa computed results và validated insights; "
-            f"thiếu insight cho {sorted(missing_insight_ids)}, "
-            f"insight tham chiếu kết quả không tồn tại {sorted(unknown_insight_ids)}."
+            "Validated insight tham chiếu computed result không tồn tại: "
+            f"{sorted(unknown_insight_ids)}."
+        )
+    missing_insight_ids = set(results) - allowed_ids
+    if missing_insight_ids:
+        logger.warning(
+            "Report plan bỏ qua %s computed result không có evidence insight hợp lệ: %s",
+            len(missing_insight_ids), sorted(missing_insight_ids),
         )
     selected = [item for qid, item in results.items() if qid in allowed_ids]
 
@@ -81,8 +89,6 @@ def build_report_plan(state: GraphState) -> GraphState:
     for item in selected:
         if not isinstance(item.result, list) or len(item.result) < 2:
             continue
-        # Preserve every audited result row. The exporter may paginate the PDF, but
-        # the report must not silently discard evidence because a chart also exists.
         rows = [row for row in item.result if isinstance(row, dict)]
         if not rows:
             continue

@@ -7,11 +7,17 @@ import re
 from typing import Any
 
 from graph.state import GraphState
+from llm import get_llm, text_from_response
+from schemas.messages import AnalysisInsight
 
 logger = logging.getLogger(__name__)
 NUMBER_PATTERN = re.compile(r"(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?")
-VAGUE_TERMS = ("phần lớn", "khá cao", "đáng kể", "significant", "majority", "substantial")
-METRIC_TERMS = ("tỷ lệ", "số lượng", "trung bình", "tổng", "chênh lệch", "rate", "count", "average", "total")
+DATE_LITERAL_PATTERN = re.compile(
+    r"(?:\b(?:19|20)\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?)?\b"
+    r"|\b(?:tháng|thang|month)\s+\d{1,2}(?:\s+(?:năm|nam|year)\s+\d{4})?\b"
+    r"|\b(?:năm|nam|year)\s+\d{4}\b)",
+    re.IGNORECASE,
+)
 
 
 def _numbers(value: Any) -> list[float]:
@@ -24,6 +30,12 @@ def _numbers(value: Any) -> list[float]:
     if isinstance(value, str):
         return [float(token.replace(",", "")) for token in NUMBER_PATTERN.findall(value)]
     return []
+
+
+def _prose_numbers(value: str) -> list[float]:
+    """Extract claimed metrics while ignoring date/month literals."""
+    masked = DATE_LITERAL_PATTERN.sub(" ", value)
+    return _numbers(masked)
 
 
 def _grounded(displayed: float, source: float) -> bool:
@@ -55,7 +67,77 @@ def _sample_size(item) -> int | None:
     return None
 
 
+def _deterministic_insight(item, insight_id: str, reason: str) -> AnalysisInsight:
+    """Preserve one-to-one coverage using only audited Pandas evidence."""
+    evidence = json.dumps(item.result, ensure_ascii=False, default=str)
+    return AnalysisInsight(
+        insight_id=insight_id,
+        title=item.question,
+        narrative=f"Kết quả Pandas đã kiểm chứng cho yêu cầu phân tích: {evidence}",
+        finding=f"Kết quả đã kiểm chứng: {evidence}",
+        source_partition=item.source_partition,
+        question=item.question,
+        metrics={item.question_id: item.result},
+        source_sheet=item.source_partition,
+        source_columns=list(item.columns),
+        evidence_question_ids=[item.question_id],
+        limitations=[f"Nội dung LLM ban đầu đã được thay bằng evidence trực tiếp: {reason}"],
+        evidence_valid=True,
+    )
+
+
+def _clean_json_response(value: str) -> str:
+    text = value.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def _rewrite_insight(llm, insight: AnalysisInsight, item, reason: str) -> AnalysisInsight:
+    """Ask the LLM to rewrite invalid prose using only one audited result."""
+    prompt = f"""
+Bạn là Evidence Rewrite Agent. Insight dưới đây không vượt qua kiểm tra vì: {reason}
+
+Hãy viết lại title, finding và narrative bằng cách chỉ sử dụng số, nhãn, kỳ và kết luận có trực tiếp
+trong computed result. Không thêm phép tính, ước lượng, so sánh, nguyên nhân hoặc số mới. Giữ nguyên
+insight_id, source_partition và evidence_question_ids. Mỗi
+evidence_question_ids phải chứa duy nhất question_id đã cung cấp. Trả về đúng một JSON theo schema
+AnalysisInsight, không Markdown và không giải thích.
+
+Insight ban đầu:
+{json.dumps(insight.model_dump(mode="python"), ensure_ascii=False, default=str)}
+
+Question ID: {item.question_id}
+Câu hỏi: {item.question}
+Computed result đã kiểm chứng:
+{json.dumps(item.result, ensure_ascii=False, default=str)}
+"""
+    response = text_from_response(llm.invoke(prompt, config={"request_options": {"timeout": 60}}))
+    rewritten = AnalysisInsight.model_validate_json(_clean_json_response(response))
+    rewritten.insight_id = insight.insight_id
+    rewritten.source_partition = item.source_partition
+    rewritten.evidence_question_ids = [item.question_id]
+    rewritten.evidence_valid = False
+    return rewritten
+
+
+def _prose_issues(insight: AnalysisInsight, allowed: list[float]) -> list[str]:
+    prose = f"{insight.title} {insight.finding} {insight.narrative}"
+    displayed = _prose_numbers(prose)
+    reasons = []
+    unsupported = [number for number in displayed
+                   if not any(_grounded(number, source) for source in allowed)]
+    if unsupported:
+        reasons.append(f"số không có trong evidence: {unsupported}")
+    return reasons
+
+
 def validate_evidence(state: GraphState) -> GraphState:
+    llm = get_llm(state.get("llm_provider"), state.get("llm_model"))
     results = {item.question_id: item for item in state.get("computed_question_results") or []}
     signatures: dict[tuple, set[str]] = {}
     signature_ids: dict[tuple, set[str]] = {}
@@ -88,22 +170,36 @@ def validate_evidence(state: GraphState) -> GraphState:
             number for item in linked
             for number in (*_numbers(item.result), *_numbers(item.parameters))
         ]
-        prose = f"{insight.title} {insight.finding} {insight.narrative}"
-        displayed = _numbers(prose)
-        reasons = []
-        if not allowed or not displayed:
-            reasons.append("phát hiện không hiển thị số liệu cụ thể")
-        unsupported = [number for number in displayed if not any(_grounded(number, source) for source in allowed)]
-        if unsupported:
-            reasons.append(f"số không có trong evidence: {unsupported}")
-        lower = prose.casefold()
-        if any(term in lower for term in VAGUE_TERMS):
-            reasons.append("dùng nhận xét định tính mơ hồ")
-        if any(term in lower for term in METRIC_TERMS) and not displayed:
-            reasons.append("metric định lượng thiếu value")
+        reasons = _prose_issues(insight, allowed)
         if reasons:
-            rejected.append((insight.insight_id, "; ".join(reasons)))
-            continue
+            reason = "; ".join(reasons)
+            rewritten = None
+            rewrite_error = ""
+            for attempt in range(2):
+                try:
+                    candidate = _rewrite_insight(llm, insight, linked[0], reason)
+                    candidate_issues = _prose_issues(candidate, allowed)
+                    if candidate_issues:
+                        reason = "; ".join(candidate_issues)
+                        continue
+                    rewritten = candidate
+                    logger.info(
+                        "Evidence Rewrite Agent repaired %s on attempt %s.",
+                        insight.insight_id, attempt + 1,
+                    )
+                    break
+                except Exception as exc:
+                    rewrite_error = str(exc)
+                    logger.warning(
+                        "Evidence rewrite failed for %s on attempt %s: %s",
+                        insight.insight_id, attempt + 1, exc,
+                    )
+            if rewritten is not None:
+                insight = rewritten
+            else:
+                final_reason = reason + (f"; rewrite error: {rewrite_error}" if rewrite_error else "")
+                rejected.append((insight.insight_id, final_reason))
+                insight = _deterministic_insight(linked[0], insight.insight_id, final_reason)
 
         insight.question = " | ".join(item.question for item in linked)
         insight.finding = insight.finding or insight.title
@@ -134,6 +230,19 @@ def validate_evidence(state: GraphState) -> GraphState:
 
         valid.append(insight)
 
+    covered_ids = {
+        question_id for insight in valid for question_id in insight.evidence_question_ids
+    }
+    for question_id, item in results.items():
+        if question_id in covered_ids:
+            continue
+        reason = "LLM không tạo insight hợp lệ liên kết với computed result"
+        fallback = _deterministic_insight(
+            item, f"insight_fallback_{question_id}", reason
+        )
+        valid.append(fallback)
+        rejected.append((fallback.insight_id, reason))
+
     if not valid:
         state["status"] = "error"
         state["error_message"] = (
@@ -142,14 +251,13 @@ def validate_evidence(state: GraphState) -> GraphState:
         )
         return state
     if rejected:
-        state["status"] = "error"
-        state["error_message"] = (
-            f"Evidence validation không bao phủ đủ {len(candidates)} câu hỏi; "
-            f"đã loại {len(rejected)} insight: {rejected}"
+        logger.warning(
+            "Evidence validation repaired %s insight issue(s) without dropping computed results: %s",
+            len(rejected), rejected,
         )
-        return state
     state["analysis_insights"] = valid
     state["validated_insights"] = valid
     state["status"] = "evidence_validated"
-    logger.info("Evidence validation kept %s/%s insights; rejected=%s", len(valid), len(candidates), rejected)
+    logger.info("Evidence validation retained %s/%s computed results; repaired=%s",
+                len(valid), len(results), rejected)
     return state

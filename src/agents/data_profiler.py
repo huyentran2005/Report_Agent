@@ -105,7 +105,9 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             detail["variance"] = float(df[col].var()) if df[col].notna().sum() >= 2 else None
         elif ((pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]))
               and not sensitive_name and semantic_type in {"categorical", "boolean/status"}):
-            top_values = df[col].value_counts().nlargest(5).to_dict()
+            counts = df[col].value_counts()
+            counts.index = counts.index.infer_objects()
+            top_values = counts.nlargest(5).to_dict()
             detail["top_5_values"] = {str(key): int(value) for key, value in top_values.items()}
         details_by_column[col_name] = detail
     return details_by_column

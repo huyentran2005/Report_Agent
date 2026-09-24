@@ -619,8 +619,6 @@ def generate_visuals(state: GraphState) -> GraphState:
             dimensions = plan.get("group_by") or []
             metrics = plan.get("metrics") or []
             transforms = plan.get("transforms") or []
-            # Multiple independent dimensions must be split by Question Planner;
-            # do not manufacture separate analyses from one cross-tab result here.
             if metrics and not transforms and len(dimensions) == 1:
                 chart_specs = [(dimension, metric) for dimension in dimensions for metric in metrics]
         for dimension, metric in chart_specs:

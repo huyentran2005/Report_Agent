@@ -22,6 +22,16 @@ PATHS.create()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def _arrow_safe_preview(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize mixed object columns before Streamlit/Arrow serialization."""
+    safe = frame.copy()
+    for column in safe.columns:
+        series = safe[column]
+        if pd.api.types.is_object_dtype(series):
+            safe[column] = series.map(lambda value: None if pd.isna(value) else str(value))
+    return safe
+
 PROVIDERS = {
     "Google Gemini": ("gemini", "GEMINI_MODEL", "gemini-2.5-flash"),
     "ProxyLLM / OpenAI": ("proxyllm", "PROXYLLM_MODEL", "gpt-4o-mini"),
@@ -183,7 +193,7 @@ if uploaded:
         else:
             sample = preview_csv(uploaded.getvalue())
         with st.expander("Xem trước dữ liệu", icon=":material/table_view:"):
-            st.dataframe(sample, height=280)
+            st.dataframe(_arrow_safe_preview(sample), height=280)
             st.caption(f"Hiển thị tối đa 20 dòng · {len(sample.columns)} cột")
     except Exception as exc:
         st.warning(f"Không thể xem trước CSV: {exc}")

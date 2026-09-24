@@ -30,3 +30,4 @@ class GraphState(TypedDict):
     analysis_partitions: NotRequired[List[str]]
     sheet_profiles: NotRequired[dict[str, dict[str, object]]]
     data_scope_profiles: NotRequired[dict[str, dict[str, object]]]
+    report_execution_state: NotRequired[dict[str, object]]

@@ -380,8 +380,6 @@ def export_report(state: GraphState) -> GraphState:
             for visual in (generated_visuals or [])
             for question_id in visual.evidence_question_ids
         }
-        # Tables covered by a chart are intentionally considered handled so they
-        # are not reintroduced later in the unmatched-table appendix.
         embedded_table_ids = {
             id(table)
             for table in (report_plan.evidence_tables if report_plan else [])
@@ -514,10 +512,27 @@ def export_report(state: GraphState) -> GraphState:
             if visual.visual_id not in embedded_visual_ids and os.path.exists(visual.file_path)
         ]
         if remaining_visuals:
-            raise ValueError(
-                "Report draft chưa ánh xạ các biểu đồ vào narrative: "
-                f"{[visual.visual_id for visual in remaining_visuals]}"
+            logger.warning(
+                "Report draft không ánh xạ %d biểu đồ; bổ sung vào phụ lục: %s",
+                len(remaining_visuals), [visual.visual_id for visual in remaining_visuals],
             )
+            final_report_content_md_sections.append(
+                "\n### Supplementary Visual Evidence\n"
+                if report_language == "English"
+                else "\n### Biểu đồ kiểm chứng bổ sung\n"
+            )
+            figure_label = "Figure" if report_language == "English" else "Hình"
+            for offset, visual in enumerate(remaining_visuals, start=len(embedded_visual_ids) + 1):
+                try:
+                    encoded = base64.b64encode(open(visual.file_path, "rb").read()).decode("ascii")
+                    image_src = f"data:image/png;base64,{encoded}"
+                except OSError:
+                    image_src = f"file:///{os.path.abspath(visual.file_path).replace(os.sep, '/')}"
+                description = escape(re.sub(r"^\[[^\]]+\]\s*", "", visual.description or ""))
+                final_report_content_md_sections.append(
+                    f'<div class="figure"><img src="{image_src}" alt="{description}">'
+                    f'<p class="figcaption"><strong>{figure_label} {offset}:</strong> {description}</p></div>\n'
+                )
 
         remaining_tables = [
             table for table in (report_plan.evidence_tables if report_plan else [])

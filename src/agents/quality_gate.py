@@ -60,6 +60,20 @@ def validate_report(state: GraphState) -> GraphState:
         state['error_message'] = "Cannot validate report: required report draft or audited results are missing."
         return state
 
+    compact_results = []
+    for item in computed_results:
+        payload = item.model_dump(mode="python")
+        if isinstance(payload.get("result"), list) and len(payload["result"]) > 60:
+            payload["result"] = payload["result"][:60]
+            payload["result_truncated"] = True
+        encoded = json.dumps(payload, ensure_ascii=False, default=str)
+        compact_results.append(encoded[:14000])
+    compact_results_text = "[\n" + ",\n".join(compact_results)[:70000] + "\n]"
+    compact_insights = json.dumps(
+        [insight.model_dump(mode="python") for insight in validated_insights],
+        ensure_ascii=False, indent=2, default=str,
+    )[:50000]
+
 
     max_retries = 3
     base_delay = 2
@@ -144,23 +158,23 @@ def validate_report(state: GraphState) -> GraphState:
                 },
             }
             prompt = PromptTemplate.from_template(prompt_template).format(
-                report_draft=report_draft.model_dump_json(indent=2),
+                report_draft=json.dumps(
+                    report_draft.model_dump(mode="python"),
+                    ensure_ascii=False, indent=2, default=str,
+                ),
                 instructions=instructions,
                 dataframe_profile=json.dumps(compact_profile, ensure_ascii=False, indent=2),
                 computed_results=json.dumps(
-                    [item.model_dump(mode="json") for item in computed_results],
-                    ensure_ascii=False,
-                    indent=2,
+                    compact_results_text, ensure_ascii=False,
                 ),
                 validated_insights=json.dumps(
-                    [insight.model_dump(mode="json") for insight in validated_insights],
-                    ensure_ascii=False,
-                    indent=2,
+                    compact_insights, ensure_ascii=False,
                 ),
                 generated_visuals=json.dumps(
-                    [visual.model_dump(mode="json", exclude={"chart_code"}) for visual in generated_visuals],
+                    [visual.model_dump(mode="python", exclude={"chart_code"}) for visual in generated_visuals],
                     ensure_ascii=False,
                     indent=2,
+                    default=str,
                 ),
                 format_instructions=parser.get_format_instructions()
             )
@@ -179,11 +193,6 @@ def validate_report(state: GraphState) -> GraphState:
                 return state
 
             if not validated_result['is_accurate']:
-                # The report writer has already applied deterministic numeric-grounding and
-                # chart/evidence-completeness checks.  A second LLM cannot reliably reproduce
-                # those checks and has produced false negatives (for example, claiming that
-                # chart evidence is absent even when its metadata is present).  Keep its
-                # semantic review as a diagnostic, but do not create a stochastic rewrite loop.
                 logger.warning(
                     "Advisory accuracy review did not pass after deterministic validation: %s",
                     validated_result['reasoning'],

@@ -104,6 +104,17 @@ class AnalysisSort(BaseModel):
     by: str
     ascending: bool = True
 
+    @field_validator("by", mode="before")
+    @classmethod
+    def normalize_sort_column(cls, value):
+        """Accept an LLM-emitted candidate list and keep one sort column."""
+        if isinstance(value, (list, tuple)):
+            candidates = [str(item).strip() for item in value if str(item).strip()]
+            if not candidates:
+                raise ValueError("sort.by phải chứa tên cột hợp lệ")
+            return candidates[-1]
+        return value
+
 
 class StructuredAnalysisPlan(BaseModel):
     """Declarative analysis plan compiled by the generic Pandas executor."""

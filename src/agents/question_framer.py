@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 import pandas as pd
 from langchain_core.output_parsers import JsonOutputParser
@@ -12,13 +13,15 @@ from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, Field, model_validator
 
 from agents.analysis_plan_executor import execute_analysis_plan
+from agents.pandas_sandbox import execute_pandas
 from data_io import (effective_instructions, infer_column_semantic, read_dataset_partitions,
                      split_partitions_by_source, to_datetime_series)
 from graph.state import GraphState
 from llm import get_llm, text_from_response
 from privacy import is_person_name_column, safe_column_details
 from schemas.messages import (AnalysisCoverageMap, ComputedQuestionResult, DataProfile,
-                              FramedQuestion, QuestionDataScope, StructuredAnalysisPlan)
+                              ColumnAnalysisRole, FramedQuestion, QuestionDataScope,
+                              StructuredAnalysisPlan)
 
 logger = logging.getLogger(__name__)
 MAX_PLAN_REVISIONS = 2
@@ -59,6 +62,15 @@ class RepairedPlanOutput(BaseModel):
 
 class CoverageSupplementOutput(BaseModel):
     questions: List[FramedQuestion] = Field(min_length=1)
+
+
+class PandasPlannerAction(BaseModel):
+    action: Literal["inspect_schema", "sample_rows", "execute_pandas", "finish"]
+    code: str | None = None
+    reasoning: str = ""
+
+
+MAX_PANDAS_ACTIONS = 8
 
 
 def _clean_json_response(response: str) -> str:
@@ -238,29 +250,6 @@ def compact_computed_results(results, max_items: int = 20) -> List[Dict[str, Any
     return compacted
 
 
-def execute_question(df, question: FramedQuestion) -> ComputedQuestionResult:
-    _sync_question_plan(question)
-    result, calculation, columns = execute_analysis_plan(df, question.plan)
-    return ComputedQuestionResult(
-        question_id=question.question_id,
-        question=question.question,
-        operation=question.operation,
-        columns=columns,
-        parameters={
-            "analysis_type": question.analysis_type,
-            "expected_result": question.expected_result,
-            "visualization": question.visualization,
-            "theme_ids": question.theme_ids,
-            "depends_on_question_ids": question.depends_on_question_ids,
-            "data_scope": question.scope.model_dump(mode="json"),
-            "analysis_plan": question.plan.model_dump(mode="json", exclude_none=True),
-        },
-        result=result,
-        calculation=calculation,
-        source_partition=question.source_partition,
-    )
-
-
 def _repair_plan(llm, question: FramedQuestion, error: Exception,
                  profile_context: dict[str, Any]) -> RepairedPlanOutput:
     parser = JsonOutputParser(pydantic_object=RepairedPlanOutput)
@@ -269,6 +258,8 @@ def _repair_plan(llm, question: FramedQuestion, error: Exception,
 Bạn là Query Planner. Analysis plan JSON dưới đây không chạy được bằng Generic Pandas Executor.
 Quan sát lỗi và sửa cả `question` lẫn `plan` để chúng mô tả đúng cùng một phạm vi. Chỉ dùng cột trong hồ sơ, không sinh Python,
 không đổi source_partition tùy tiện và không viết nội dung ngoài JSON.
+Không tự đổi ý nghĩa metric theo suy đoán. Nếu hồ sơ của partition không có cột mang vai trò thời gian,
+phải loại bỏ mọi tham chiếu thời gian và không được tạo cột giả.
 Với filter thời gian, dùng mốc ISO chính xác. Một năm phải dùng khoảng nửa mở
 gte YYYY-01-01 và lt (YYYY+1)-01-01 để không loại sai bản ghi có thành phần giờ.
 
@@ -376,6 +367,154 @@ def _validate_time_scope(df, question: FramedQuestion, instructions: str) -> Non
         "Hãy bỏ filter thời gian và sửa câu hỏi để phân tích toàn bộ phạm vi dữ liệu."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_invalid_mean_transform(cls, value):
+        """LLM đôi khi đặt ``mean`` vào transforms thay vì aggregation.
+
+        ``mean`` không phải phép biến đổi hậu xử lý; nó là một aggregation hợp
+        lệ của StructuredAnalysisPlan. Loại bỏ transform sai này để plan được
+        validate và executor dùng aggregation đã khai báo.
+        """
+        if not isinstance(value, dict):
+            return value
+        questions = value.get("questions") or []
+        for question in questions:
+            plan = question.get("plan") if isinstance(question, dict) else None
+            if not isinstance(plan, dict):
+                continue
+            transforms = plan.get("transforms") or []
+            plan["transforms"] = [
+                transform for transform in transforms
+                if not (isinstance(transform, dict) and transform.get("type") == "mean")
+            ]
+            if any(isinstance(transform, dict) and transform.get("type") == "mean"
+                   for transform in transforms):
+                plan.setdefault("aggregation", "mean")
+        return value
+
+
+def _execute_question_with_actions(llm, df: pd.DataFrame,
+                                   question: FramedQuestion) -> ComputedQuestionResult:
+    """Let the planner inspect, execute Pandas, observe, and finish iteratively."""
+    parser = JsonOutputParser(pydantic_object=PandasPlannerAction)
+    history: list[dict[str, Any]] = []
+    latest_result: Any = None
+    latest_code: str | None = None
+    schema = [
+        {"name": str(column), "dtype": str(df[column].dtype),
+         "semantic_type": infer_column_semantic(df[column], str(column))}
+        for column in df.columns if not str(column).startswith("_")
+    ]
+    prompt = PromptTemplate(
+        template="""
+Bạn là Pandas Planner Agent. Hãy giải quyết yêu cầu phân tích bằng vòng lặp action-observation.
+Mỗi lượt chỉ trả về một action JSON. Có bốn action:
+- inspect_schema: xem schema đã kiểm chứng;
+- sample_rows: xem tối đa 5 dòng mẫu;
+- execute_pandas: chạy code Pandas đọc dữ liệu; code bắt buộc dùng dataframe `df`, không import,
+  không đọc/ghi file, không gọi mạng và phải gán kết quả cuối vào biến `result`;
+- finish: chỉ dùng sau khi đã có kết quả đủ trả lời câu hỏi.
+
+Không dùng tên cột ngoài schema. Không tự gán ý nghĩa nghiệp vụ hoặc phạm vi không có trong yêu cầu.
+Quan sát lỗi của action trước và sửa code ở lượt sau. Không trả Markdown hoặc nội dung ngoài JSON.
+
+Câu hỏi: {question}
+Schema: {schema}
+Kế hoạch định hướng ban đầu: {plan}
+Lịch sử action-observation: {history}
+Đã có kết quả thực thi: {has_result}
+{format_instructions}
+""",
+        input_variables=["question", "schema", "plan", "history", "has_result"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+    for _ in range(MAX_PANDAS_ACTIONS):
+        raw = text_from_response(llm.invoke(prompt.invoke({
+            "question": question.question,
+            "schema": json.dumps(schema, ensure_ascii=False),
+            "plan": question.plan.model_dump_json(exclude_none=True),
+            "history": json.dumps(history, ensure_ascii=False, default=str),
+            "has_result": latest_result is not None,
+        }), config={"request_options": {"timeout": 60}}))
+        action = PandasPlannerAction.model_validate_json(_clean_json_response(raw))
+        if action.action == "inspect_schema":
+            observation = {"schema": schema, "row_count": len(df)}
+        elif action.action == "sample_rows":
+            observation = {"rows": df.head(5).astype(object).where(pd.notna(df.head(5)), None).to_dict("records")}
+        elif action.action == "execute_pandas":
+            if not action.code:
+                observation = {"error": "execute_pandas yêu cầu trường code."}
+            else:
+                try:
+                    latest_result = execute_pandas(action.code, df)
+                    latest_code = action.code
+                    observation = {"result": latest_result}
+                except Exception as exc:
+                    observation = {"error": str(exc)}
+        else:
+            if latest_result is None or not latest_code:
+                observation = {"error": "Chưa có kết quả execute_pandas để hoàn tất."}
+            else:
+                return ComputedQuestionResult(
+                    question_id=question.question_id, question=question.question,
+                    operation=question.operation, columns=question.columns,
+                    parameters={
+                        "analysis_type": question.analysis_type,
+                        "expected_result": question.expected_result,
+                        "visualization": question.visualization,
+                        "theme_ids": question.theme_ids,
+                        "data_scope": question.scope.model_dump(mode="json"),
+                        "analysis_plan": question.plan.model_dump(mode="json", exclude_none=True),
+                        "pandas_action": latest_code,
+                    },
+                    result=latest_result, calculation=latest_code,
+                    source_partition=question.source_partition,
+                )
+        history.append({"action": action.model_dump(mode="json"), "observation": observation})
+    if latest_result is not None and latest_code:
+        logger.warning(
+            "Pandas Planner reached %s actions without finish; auto-finalizing the latest result.",
+            MAX_PANDAS_ACTIONS,
+        )
+        return ComputedQuestionResult(
+            question_id=question.question_id, question=question.question,
+            operation=question.operation, columns=question.columns,
+            parameters={
+                "analysis_type": question.analysis_type,
+                "expected_result": question.expected_result,
+                "visualization": question.visualization,
+                "theme_ids": question.theme_ids,
+                "data_scope": question.scope.model_dump(mode="json"),
+                "analysis_plan": question.plan.model_dump(mode="json", exclude_none=True),
+                "pandas_action": latest_code,
+            },
+            result=latest_result, calculation=latest_code,
+            source_partition=question.source_partition,
+        )
+    try:
+        fallback_result, fallback_code, _ = execute_analysis_plan(df, question.plan)
+        return ComputedQuestionResult(
+            question_id=question.question_id, question=question.question,
+            operation=question.operation, columns=question.columns,
+            parameters={
+                "analysis_type": question.analysis_type,
+                "expected_result": question.expected_result,
+                "visualization": question.visualization,
+                "theme_ids": question.theme_ids,
+                "data_scope": question.scope.model_dump(mode="json"),
+                "analysis_plan": question.plan.model_dump(mode="json", exclude_none=True),
+                "pandas_action": fallback_code,
+                "planner_fallback": True,
+            },
+            result=fallback_result, calculation=fallback_code,
+            source_partition=question.source_partition,
+        )
+    except Exception as fallback_exc:
+        raise ValueError(
+            f"Pandas Planner vượt quá {MAX_PANDAS_ACTIONS} action và plan dự phòng cũng lỗi: {fallback_exc}"
+        ) from fallback_exc
+
 
 def _execute_with_revision(llm, question: FramedQuestion, partitions,
                            profile_context: dict[str, Any], instructions: str) -> ComputedQuestionResult:
@@ -387,7 +526,12 @@ def _execute_with_revision(llm, question: FramedQuestion, partitions,
                 raise ValueError(f"source_partition không hợp lệ: {question.source_partition!r}")
             _validate_question_scope(partitions[question.source_partition], question, instructions)
             _validate_time_scope(partitions[question.source_partition], question, instructions)
-            return execute_question(partitions[question.source_partition], question)
+            partition_df = partitions[question.source_partition]
+            logger.info(
+                "Question %s executing ACTIVE Pandas Planner action loop (partition=%s).",
+                question.question_id, question.source_partition,
+            )
+            return _execute_question_with_actions(llm, partition_df, question)
         except (ValueError, TypeError, KeyError) as exc:
             last_error = exc
             if attempt >= MAX_PLAN_REVISIONS:
@@ -452,41 +596,179 @@ def _split_independent_group_dimensions(questions: List[FramedQuestion]) -> List
 
 def _build_coverage_map(llm, profile_context: dict[str, Any], instructions: str) -> AnalysisCoverageMap:
     parser = JsonOutputParser(pydantic_object=AnalysisCoverageMap)
+    compact_profiles: dict[str, Any] = {}
+    detail_keys = {
+        "type", "semantic_type", "dtype", "unique_values_count",
+        "missing_values_count", "min", "max", "mean", "std",
+        "top_5_values", "years", "is_sensitive_person_name",
+    }
+    for partition, profile in profile_context.items():
+        details = profile.get("column_details") or {}
+        compact_details = {
+            column: {key: value for key, value in (detail or {}).items() if key in detail_keys}
+            for column, detail in details.items()
+        }
+        scope = profile.get("data_scope")
+        if isinstance(scope, dict):
+            scope = dict(scope)
+            dimensions = []
+            for dimension in scope.get("dimensions") or []:
+                item = dict(dimension)
+                if isinstance(item.get("values"), list):
+                    item["values"] = item["values"][:10]
+                if isinstance(item.get("periods"), list):
+                    item["periods"] = item["periods"][:24]
+                dimensions.append(item)
+            scope["dimensions"] = dimensions
+        compact_profiles[partition] = {
+            "num_rows": profile.get("num_rows"),
+            "column_details": compact_details,
+            "data_scope": scope,
+        }
     prompt = PromptTemplate(
         template="""
-Bạn là Data Semantics Analyst. Trước khi đặt câu hỏi, hãy xây dựng Analysis Coverage Map cho toàn
-bộ file. Phân loại từng cột an toàn vào đúng vai trò: time, measure, outcome, driver, category,
-geography, operation, identifier, free_text, sensitive hoặc exclude. Không suy diễn lĩnh vực ngoài
-tên cột, thống kê hồ sơ và yêu cầu người dùng.
+Bạn là **Data Semantics Analyst**. Nhiệm vụ là xây dựng **Analysis Coverage Map** cho toàn bộ dữ liệu trước khi sinh bất kỳ câu hỏi phân tích nào.
 
-Sau đó nhóm các cột liên quan thành analytical themes có ý nghĩa. Mỗi theme phải là một quan hệ
-phân tích nguyên tử, đủ cụ thể để kiểm tra coverage: xu hướng theo thời gian, hiệu quả theo khu vực,
-hiệu suất theo SẢN PHẨM, hiệu suất theo DANH MỤC và vận hành giao hàng phải là các theme riêng.
-Không gộp sản phẩm và danh mục vào cùng một theme hoặc một plan: đây là hai dimension độc lập.
-Các cột tên sản phẩm có nhiều giá trị vẫn là category phân tích hợp lệ nếu giá trị lặp lại; không
-đánh dấu free_text/exclude chỉ vì cardinality cao. Với dimension có nhiều nhóm, dùng top N hợp lý
-trong câu hỏi và biểu đồ thay vì bỏ dimension khỏi coverage. Không gộp tất cả vào một
-bucket rộng như "phân tích doanh thu". Theme không phải một câu hỏi cho từng cột và vẫn có thể chứa
-nhiều metric liên quan, ví dụ hiệu quả theo khu vực gồm đồng thời doanh thu và lợi nhuận. Đặt required=true cho mọi
-theme cần có trong báo cáo; loại identifier, tên người, metadata, text tự do, cột hằng và tổ hợp vô
-nghĩa. Mỗi theme chỉ thuộc một source_partition và chỉ dùng tên cột chính xác trong partition đó.
+Dữ liệu có thể gồm một hoặc nhiều file, sheet hoặc bảng. Mỗi nguồn độc lập được xem là một `source_partition`. Chỉ được suy luận từ **tên cột, dtype, thống kê dữ liệu, cấu trúc partition và yêu cầu người dùng**. Không tự suy diễn lĩnh vực, ý nghĩa nghiệp vụ hoặc quan hệ không có bằng chứng.
 
-Hồ sơ dữ liệu: {profiles}
-Yêu cầu người dùng: {instructions}
+Không gán ý nghĩa nghiệp vụ cụ thể cho metric nếu tên cột, tên nguồn hoặc yêu cầu người dùng không cung cấp bằng chứng trực tiếp. Nếu partition không có cột được phân loại `time`, tuyệt đối không tạo theme hoặc phạm vi thời gian và không tự sinh cột thời gian.
+
+`instructions` là yêu cầu phân tích do người dùng nhập. Hãy bóc tách yêu cầu này thành các quan hệ phân tích cần coverage; giữ nguyên mục tiêu, metric và dimension mà người dùng nêu, nhưng chỉ ánh xạ chúng vào những cột thực sự tồn tại và có bằng chứng từ hồ sơ. Không tự thêm mục tiêu ngoài yêu cầu khi dữ liệu không hỗ trợ.
+
+### 1. Xác định source_partition
+
+- Xác định toàn bộ partition xuất hiện trong `{profiles}` và giữ nguyên tên gốc.
+- Nếu chỉ có một nguồn, chỉ tạo một `source_partition`.
+- Nếu có nhiều nguồn, xử lý từng partition độc lập.
+- Không mặc định hai cột cùng tên ở hai partition biểu diễn cùng một thực thể.
+- Không kết hợp dữ liệu giữa các partition nếu hồ sơ không cung cấp bằng chứng rõ ràng về khả năng join.
+
+### 2. Phân loại cột
+
+Trong từng partition, gán mỗi cột vào đúng một vai trò:
+
+`time`, `measure`, `outcome`, `driver`, `category`, `geography`, `operation`, `identifier`, `free_text`, `sensitive`, `exclude`.
+
+Quy tắc:
+
+- `identifier`: ID, mã bản ghi hoặc khóa kỹ thuật; không dùng làm dimension nếu gần như unique.
+- `category`: giá trị có tính phân nhóm/so sánh và có lặp lại.
+- Cardinality cao không phải lý do để loại một cột khỏi `category`.
+- `free_text`: chỉ dành cho văn bản tự do, mô tả, ghi chú hoặc nội dung phi cấu trúc; không dùng chỉ vì cột có nhiều giá trị.
+- `sensitive`: dữ liệu định danh cá nhân hoặc nhạy cảm; không dùng làm dimension nếu người dùng không yêu cầu rõ ràng.
+- `exclude`: cột hằng, gần như trống, metadata kỹ thuật hoặc không có giá trị phân tích.
+- Không dùng `exclude` như phương án mặc định khi khó xác định vai trò.
+
+### 3. Xây dựng analytical themes
+
+Từ các cột hợp lệ, tạo bộ **analytical themes nhỏ nhất nhưng đủ bao phủ các quan hệ phân tích quan trọng**.
+
+Ưu tiên yêu cầu phân tích trong `instructions`: nếu người dùng đã nêu các mục tiêu cụ thể, chỉ tạo
+theme cho các mục tiêu đó và các dimension được nêu hoặc bắt buộc để trả lời chúng. Không tự mở rộng
+thành danh sách phân tích phổ biến của lĩnh vực. Mỗi theme chỉ có **một dimension phân tích chính**
+(một cột time/category/geography/operation/driver) và một hoặc nhiều metric liên quan; không tạo
+theme có tiêu đề hoặc columns gộp nhiều dimension độc lập. Nếu một yêu cầu có nhiều dimension, tạo
+một theme riêng cho từng dimension ngay từ đầu, không tạo theme lai rồi chờ bước sau tách.
+
+Mỗi theme phải:
+
+- thuộc đúng một `source_partition`;
+- biểu diễn một quan hệ phân tích nguyên tử;
+- sử dụng một dimension hoặc một nhóm dimension thực sự gắn kết;
+- có thể liên kết với một hoặc nhiều metric liên quan trực tiếp;
+- chỉ sử dụng tên cột tồn tại trong partition đó.
+
+**Tách theme khi dimension khác nhau về bản chất.**
+
+Không:
+
+- tạo theme quá rộng không chỉ rõ dimension và metric;
+- tạo theme cho từng cột một cách máy móc;
+- tạo nhiều theme biểu diễn cùng một quan hệ;
+- tạo theme chỉ để tăng coverage.
+
+Ngược lại, nhiều metric có thể cùng thuộc một theme nếu chúng cùng đánh giá một dimension. Không gộp các dimension khác bản chất chỉ vì chúng sử dụng chung metric.
+
+Nếu dimension có cardinality cao nhưng vẫn có ý nghĩa phân tích, giữ theme đó. Việc giới hạn **Top N** được xử lý ở bước phân tích/visualization sau này.
+
+### 4. Xác định required
+
+Đặt `required=true` khi theme thỏa ít nhất một điều kiện:
+
+- trực tiếp phục vụ `{instructions}`;
+- hoặc là quan hệ tối thiểu bắt buộc để trả lời một yêu cầu trực tiếp trong `{instructions}`.
+
+Không đặt `required=true` chỉ vì cột tồn tại, có thể tạo biểu đồ, có nhiều metric, hoặc có khả năng
+tạo insight chung chung. Nếu không có yêu cầu trực tiếp và quan hệ không đủ bằng chứng, đặt
+`required=false` hoặc không tạo theme.
+
+Coverage phải được đánh giá trên **toàn bộ các source_partition**, không được chỉ tập trung vào partition lớn nhất hoặc đầu tiên.
+
+### 5. Ràng buộc partition
+
+Mỗi theme chỉ thuộc một `source_partition`, chỉ dùng cột của partition đó, giữ chính xác tên partition và tên cột gốc, không dịch/viết tắt/tự tạo tên cột, và không cross-partition nếu chưa có bằng chứng rõ ràng cho phép join.
+
+`column_details` và `data_scope.dimensions[].column` là danh sách tên cột hợp lệ duy nhất. Nội dung trong `top_5_values`, `values` hoặc `periods` là **giá trị dữ liệu**, không phải tên cột và tuyệt đối không được đưa vào `column_roles` hoặc `theme.columns`. Nếu hồ sơ không có dimension phù hợp, không được tạo theme bằng cách biến giá trị mẫu thành cột.
+
+Nếu nhiều partition có schema tương tự, chỉ coi chúng là một nguồn phân tích chung khi `{profiles}` xác nhận rõ chúng có thể hợp nhất. Nếu không, giữ riêng.
+
+### 6. Mục tiêu của Coverage Map
+
+Coverage Map chỉ trả lời: **“Những khía cạnh nào của dữ liệu cần được phân tích?”**
+
+Không sinh câu hỏi phân tích, viết Pandas query, thực hiện phép tính, đưa ra insight, đề xuất biểu đồ hoặc kết luận từ dữ liệu.
+
+Ưu tiên **ít theme nhưng đủ coverage**, thay vì tạo nhiều theme nhỏ, trùng lặp hoặc không có giá trị.
+
+### INPUT
+
+Hồ sơ dữ liệu:
+{profiles}
+
+Yêu cầu người dùng:
+{instructions}
+
 {format_instructions}
-Chỉ trả về JSON hợp lệ.
+
+### OUTPUT
+
+Chỉ trả về **JSON hợp lệ** đúng schema `AnalysisCoverageMap`. Không Markdown, không giải thích, không thêm nội dung ngoài JSON.
 """,
         input_variables=["profiles", "instructions"],
         partial_variables={"format_instructions": parser.get_format_instructions()},
     )
+    compact_profiles_json = json.dumps(compact_profiles, ensure_ascii=False, indent=2, default=str)
+    compact_profiles_json = compact_profiles_json[:60000]
     response = text_from_response(llm.invoke(prompt.invoke({
-        "profiles": json.dumps(profile_context, ensure_ascii=False, indent=2),
+        "profiles": compact_profiles_json,
         "instructions": instructions,
     }), config={"request_options": {"timeout": 60}}))
     return AnalysisCoverageMap.model_validate_json(_clean_json_response(response))
 
 
 def _validate_coverage_map(coverage_map: AnalysisCoverageMap, partitions) -> None:
+    role_keys = {(item.source_partition, item.column) for item in coverage_map.column_roles}
+    for partition, frame in partitions.items():
+        for column in frame.columns:
+            column = str(column)
+            key = (partition, column)
+            if column.startswith("_") or key in role_keys or is_person_name_column(column, frame[column]):
+                continue
+            semantic = infer_column_semantic(frame[column], column)
+            role = {
+                "datetime": "time",
+                "numeric_measure": "measure",
+                "categorical": "category",
+                "boolean/status": "category",
+                "identifier": "identifier",
+            }.get(semantic, "free_text")
+            coverage_map.column_roles.append(ColumnAnalysisRole(
+                column=column,
+                source_partition=partition,
+                role=role,
+                include_in_analysis=role not in {"free_text", "identifier"},
+                rationale="Bổ sung tự động từ schema/dtype vì LLM không liệt kê cột này.",
+            ))
     role_keys = [(item.source_partition, item.column) for item in coverage_map.column_roles]
     if len(role_keys) != len(set(role_keys)):
         raise ValueError("Coverage map phân loại trùng một cột.")
@@ -595,8 +877,13 @@ def _missing_required_themes(coverage_map: AnalysisCoverageMap,
 
 def _validate_plan_scope_coverage(questions: List[FramedQuestion], partitions,
                                   instructions: str) -> None:
-    """A complete plan must cover source partitions and multi-year time domains."""
+    """Validate requested partition coverage and only requested temporal coverage."""
     instruction_text = (instructions or "").casefold()
+    temporal_request = bool(re.search(
+        r"\b(?:time|trend|trend_over_time|temporal|year|month|quarter|week|day|date|growth|"
+        r"thời gian|xu hướng|theo năm|theo tháng|theo quý|theo tuần|theo ngày|tăng trưởng)\b",
+        instruction_text,
+    ))
     mentioned = {
         name for name in partitions if str(name).casefold() in instruction_text
     }
@@ -605,6 +892,9 @@ def _validate_plan_scope_coverage(questions: List[FramedQuestion], partitions,
     missing = required_partitions - covered_partitions
     if missing:
         raise ValueError(f"Scope Coverage còn thiếu source_partition: {sorted(missing)}")
+
+    if not temporal_request:
+        return
 
     for partition_name in required_partitions:
         frame = partitions[partition_name]
@@ -643,7 +933,7 @@ def _supplement_questions(llm, coverage_map: AnalysisCoverageMap,
     prompt = PromptTemplate(
         template="""
 Bạn là Question Planner. Kế hoạch hiện tại chưa có câu hỏi phân tích cho các analytical themes bên
-dưới. Hãy bổ sung số câu hỏi nhỏ nhất có thể bao phủ toàn bộ theme còn thiếu. Plan của câu hỏi phải
+dưới. Hãy bổ sung số câu hỏi mà bạn cảm thấy đủ để bao phủ toàn bộ theme còn thiếu. Plan của câu hỏi phải
 thực sự sử dụng ít nhất một cột thuộc theme; chỉ ghi theme_id nhưng không dùng cột theme không được
 tính là bao phủ. Một câu hỏi được phép bao
 phủ nhiều theme liên quan và nhiều metric trong cùng source_partition. Không lặp câu hiện có,
@@ -735,11 +1025,17 @@ Bạn là Question Planner. Dựa trên Analysis Coverage Map đã được lậ
 nhất nhưng bao phủ tất cả theme có required=true. Không đặt câu hỏi theo từng cột máy móc. Một câu
 hỏi có thể bao phủ nhiều theme liên quan và nhiều metric trong cùng source_partition, chẳng hạn so
 sánh đồng thời hai chỉ số kết quả theo một dimension. Mỗi câu bắt buộc khai báo `theme_ids`.
-Chỉ gộp nhiều METRIC khi chúng dùng cùng một dimension. Các dimension phân tích độc lập phải thành
-câu hỏi và plan riêng: ví dụ "doanh thu và lợi nhuận theo sản phẩm" và "doanh thu và lợi nhuận theo
-danh mục" là hai câu hỏi; không tạo group_by=[sản phẩm, danh mục], vì đó là phân tích theo tổ hợp.
-Không được bỏ câu hỏi theo sản phẩm chỉ vì cột sản phẩm có nhiều giá trị; hãy dùng sort và limit để
-tạo top N sản phẩm dễ đọc, trong khi câu hỏi theo danh mục vẫn là một plan riêng.
+`instructions` là yêu cầu phân tích chính của người dùng. Hãy bóc tách yêu cầu thành các câu hỏi nhỏ,
+mỗi câu trả lời một quan hệ phân tích nguyên tử hoặc một nhóm metric dùng chung một dimension. Giữ
+đúng phạm vi, metric, dimension và điều kiện mà người dùng yêu cầu; không gom các dimension độc lập
+vào một câu và không tự thêm mục tiêu không có trong yêu cầu. Nếu yêu cầu không nêu mục tiêu phân tích
+cụ thể, chỉ tạo các câu hỏi tối thiểu cần thiết để bao phủ các theme được đánh dấu `required`.
+Chỉ sử dụng ý nghĩa đã được Coverage Map và hồ sơ chứng minh; không tự gán ý nghĩa nghiệp vụ cho metric.
+Nếu partition không có cột mang vai trò `time` thì không được tạo phân tích, phạm vi, filter hoặc cột thời gian.
+Chỉ gộp nhiều METRIC khi chúng dùng cùng một dimension. Mỗi câu hỏi/plan chỉ dùng một dimension phân
+tích chính; các dimension phân tích độc lập phải thành câu hỏi và plan riêng, không đưa nhiều dimension
+độc lập vào cùng `group_by` để tạo phân tích tổ hợp.
+Không được bỏ một dimension có ý nghĩa chỉ vì cardinality cao; dùng `sort` và `limit` khi cần tạo kết quả dễ đọc.
 Không tạo câu trùng ý. Sắp câu hỏi theo mạch từ tổng quan đến chi tiết. Chỉ đặt
 `depends_on_question_ids` cho câu đào sâu trong CÙNG THEME thực sự cần quan sát kết quả câu trước;
 không nối tuần tự các theme độc lập. Dependency phải tham chiếu question_id tồn tại và không tạo vòng.
@@ -747,7 +1043,7 @@ Mỗi câu bắt buộc khai báo `scope` có cấu trúc. Mặc định dùng c
 source_partitions=[source_partition của plan], không có filter, và khai báo các time_columns /
 dimension_columns liên quan. Chỉ dùng user_requested_subset nếu chính người dùng yêu cầu rõ subset;
 chỉ dùng analytical_subset cho drill-down có dependency và rationale cụ thể. Mọi cột filter phải
-được khai báo trong scope; không tự giới hạn khu vực, danh mục, vận chuyển, sheet hay nhóm khác.
+được khai báo trong scope; không tự giới hạn bất kỳ dimension, partition hoặc nhóm dữ liệu nào.
 Phạm vi thời gian là một phần của tính đúng đắn: đọc `min_date`, `max_date`, `years`, `periods` trong data_scope.
 Nếu người dùng không yêu cầu một giai đoạn cụ thể, câu hỏi và plan phải dùng toàn bộ phạm vi có
 trong dữ liệu, tuyệt đối không tự chọn riêng một năm/tháng. Nếu có filter thời gian, câu hỏi phải
@@ -764,14 +1060,10 @@ Pandas Executor bằng cách kết hợp:
   rolling_mean, correlation, distribution, outlier_iqr, round;
 - sort và limit cho top/bottom N.
 
-Ví dụ tăng trưởng doanh thu tháng: group_by=["Order Date"], metrics=["Total Revenue"],
-aggregation="sum", time_grain="month", transforms=[{{"type":"pct_change","column":"Total Revenue"}}],
-sort={{"by":"Order Date","ascending":true}}.
-
 Mỗi plan chỉ dùng một source_partition và tên cột chính xác trong hồ sơ. Chỉ dùng numeric_measure
 cho tổng hợp số/correlation. Không dùng identifier, số điện thoại, mã giao dịch, tên người, text
 hoặc unknown làm measurement. Không chọn phép tính khi dữ liệu hợp lệ không đủ. Đặt analysis_type
-là nhãn ngắn (ví dụ monthly_growth, category_share), visualization nếu hữu ích, và
+là nhãn ngắn mô tả đúng phép phân tích, visualization nếu hữu ích, và
 Chỉ đưa vào `questions` những câu hỏi thực sự phục vụ báo cáo và bắt buộc
 `selected_question_ids` chứa toàn bộ question_id trong `questions`.
 Với thời gian, chỉ dùng kỳ thực sự có trong hồ sơ hoặc được người dùng yêu cầu; không tự bịa năm.

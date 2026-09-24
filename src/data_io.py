@@ -417,7 +417,7 @@ def read_dataset_partitions(
         names = [name for name, _ in group]
         frames = []
         for name, frame in group:
-            copy = frame.copy()
+            copy = add_duration_metrics(frame)
             copy.insert(0, "_source_sheet", name)
             frames.append(copy)
         key = " + ".join(names)
@@ -435,6 +435,80 @@ def split_partitions_by_source(partitions: dict[str, pd.DataFrame]) -> dict[str,
         for sheet_name, sheet_frame in frame.groupby("_source_sheet", sort=False, dropna=False):
             per_sheet[str(sheet_name)] = sheet_frame.reset_index(drop=True)
     return per_sheet
+
+
+def _duration_role(column: str) -> str | None:
+    """Classify likely start/end datetime headers without using domain assumptions."""
+    text = re.sub(r"[^a-z0-9]+", " ", str(column).casefold()).strip()
+    if re.search(r"(^| )(start|begin|created|accepted|opened|issued|from)( |$)", text):
+        return "start"
+    if re.search(
+        r"(^| )(end|finish|completed|closed|resolved|solved|received|delivered|processed|to)( |$)",
+        text,
+    ):
+        return "end"
+    return None
+
+
+def _duration_metric_name(start: str, end: str, existing: pd.Index) -> str:
+    """Create a stable semantic duration name from the two source headers."""
+    start_text = re.sub(r"[^a-z0-9]+", " ", str(start).casefold()).strip()
+    end_text = re.sub(r"[^a-z0-9]+", " ", str(end).casefold()).strip()
+    pairs = (
+        ("accept", "process", "Acceptance Processing Duration Days"),
+        ("order", "deliver", "Order Delivery Duration Days"),
+        ("create", "complete", "Completion Duration Days"),
+        ("open", "close", "Open to Close Duration Days"),
+        ("start", "end", "Process Duration Days"),
+    )
+    name = "Duration Days"
+    for left, right, candidate in pairs:
+        if left in start_text and right in end_text:
+            name = candidate
+            break
+    if name not in existing:
+        return name
+    suffix = 2
+    while f"{name} {suffix}" in existing:
+        suffix += 1
+    return f"{name} {suffix}"
+
+
+def add_duration_metrics(frame: pd.DataFrame) -> pd.DataFrame:
+    """Create duration metrics and hide their source datetime columns.
+
+    The raw workbook is never modified.  The returned analysis frame exposes
+    only the derived duration column, so downstream profiling/planning cannot
+    accidentally analyze the two source timestamps as calendar dimensions.
+    """
+    result = frame.copy()
+    datetime_columns = [
+        str(column) for column in result.columns
+        if not str(column).startswith("_") and is_date_like_series(result[column], str(column))
+    ]
+    starts = [column for column in datetime_columns if _duration_role(column) == "start"]
+    ends = [column for column in datetime_columns if _duration_role(column) == "end"]
+    if not starts or not ends:
+        return result
+    used: set[str] = set()
+    for start in starts:
+        end = next((candidate for candidate in ends if candidate not in used), None)
+        if end is None:
+            continue
+        start_values = to_datetime_series(result[start])
+        end_values = to_datetime_series(result[end])
+        duration = (end_values - start_values).dt.total_seconds() / 86400.0
+        valid = duration.notna()
+        if not valid.any():
+            continue
+        duration_name = _duration_metric_name(start, end, result.columns)
+        result[duration_name] = duration.where(duration >= 0)
+        used.add(end)
+        result = result.drop(columns=[start, end])
+        result.attrs.setdefault("derived_columns", {})[duration_name] = {
+            "source_columns": [start, end], "unit": "days", "formula": "end - start",
+        }
+    return result
 
 
 def read_dataset(path: str | Path, workbook_sheets: list[dict[str, Any]] | None = None) -> pd.DataFrame:

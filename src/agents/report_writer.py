@@ -13,6 +13,7 @@ from graph.state import GraphState
 from schemas.messages import ReportSectionsDraft
 from data_io import effective_instructions
 from privacy import is_person_name_column
+from agents.report_execution_state import build_report_execution_state
 
 logger = logging.getLogger(__name__)
 NUMBER_PATTERN = re.compile(r"(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?")
@@ -186,6 +187,48 @@ def _unsupported_report_numbers(
     return unsupported
 
 
+def _strip_unsupported_report_numbers(report_draft, computed_results,
+                                      validated_insights, dataframe_profile) -> list[float]:
+    """Remove only ungrounded numeric tokens so one hallucinated number cannot abort export."""
+    allowed = [
+        number for item in computed_results
+        for number in (*_numeric_tokens(item.result), *_numeric_tokens(item.parameters))
+    ]
+    allowed.extend(
+        number for insight in validated_insights
+        for number in _numeric_tokens({
+            "metrics": insight.metrics, "sample_size": insight.sample_size,
+            "denominator": insight.denominator, "missing_values": insight.missing_values,
+        })
+    )
+    allowed.extend(_numeric_tokens({
+        "num_rows": dataframe_profile.num_rows, "num_columns": dataframe_profile.num_columns,
+    }))
+
+    removed: list[float] = []
+
+    def clean(text: str) -> str:
+        def replace(match):
+            token = match.group(0)
+            value = float(token.replace(",", ""))
+            decimals = len(token.rsplit(".", 1)[1]) if "." in token else 0
+            if any(_matches_audited_value(value, decimals, source) for source in allowed):
+                return token
+            removed.append(value)
+            return ""
+        return NUMBER_PATTERN.sub(replace, text or "")
+
+    report_draft.report_subtitle = clean(report_draft.report_subtitle)
+    report_draft.introduction_text = clean(report_draft.introduction_text)
+    report_draft.data_quality_text = clean(report_draft.data_quality_text)
+    report_draft.analysis_narratives = [clean(text) for text in report_draft.analysis_narratives]
+    report_draft.key_takeaways_bullet_points = [clean(text) for text in report_draft.key_takeaways_bullet_points]
+    report_draft.notable_issues = [clean(text) for text in report_draft.notable_issues]
+    report_draft.conclusion_text = clean(report_draft.conclusion_text)
+    report_draft.dataset_title = clean(report_draft.dataset_title)
+    return removed
+
+
 def _remove_generic_caveats(text: str) -> str:
     """Drop boilerplate cautions that do not name a measured data limitation."""
     parts = re.split(r"(?<=[.!?;])\s+|\n+", text or "")
@@ -313,7 +356,16 @@ def draft_report(state: GraphState) -> GraphState:
             insights_context += f"Phát hiện {i + 1} (ID: {insight.insight_id}):\n"
             insights_context += f"Tiêu đề: {insight.title}\n"
             insights_context += f"Diễn giải: {insight.narrative}\n"
-            insights_context += f"Evidence đã duyệt: {json.dumps(insight.metrics, ensure_ascii=False)}\n"
+            compact_metrics = {}
+            for question_id, metric_result in (insight.metrics or {}).items():
+                if isinstance(metric_result, list) and len(metric_result) > 20:
+                    compact_metrics[question_id] = metric_result[:20]
+                else:
+                    compact_metrics[question_id] = metric_result
+            insights_context += (
+                "Evidence đã duyệt: "
+                f"{json.dumps(compact_metrics, ensure_ascii=False, default=str)}\n"
+            )
             insights_context += f"Cỡ mẫu: {insight.sample_size}; Mẫu số: {insight.denominator}\n"
             insights_context += f"Cột nguồn: {insight.source_columns}; Bộ lọc: {insight.filters}\n"
             if insight.limitations:
@@ -338,13 +390,25 @@ def draft_report(state: GraphState) -> GraphState:
                 "description": visual.description,
                 "evidence_question_ids": visual.evidence_question_ids,
             })
-    computed_facts = json.dumps(
-        [item.model_dump(mode="json") for item in computed_results], ensure_ascii=False, indent=2
-    )
+    compact_results = []
+    for item in computed_results:
+        payload = item.model_dump(mode="python")
+        value = payload.get("result")
+        if isinstance(value, list) and len(value) > 20:
+            payload["result"] = value[:20]
+            payload["context_note"] = "Kết quả rút gọn cho report LLM; evidence đầy đủ vẫn nằm trong state."
+        compact_results.append(payload)
+    computed_facts = json.dumps(compact_results, ensure_ascii=False, indent=2, default=str)
     report_plan = state.get("report_plan")
-    report_plan_context = (
-        json.dumps(report_plan.model_dump(mode="json"), ensure_ascii=False, indent=2)
-        if report_plan else "{}"
+    execution_state = build_report_execution_state(state)
+    state["report_execution_state"] = execution_state.model_dump(mode="python")
+    report_plan_payload = report_plan.model_dump(mode="python") if report_plan else {}
+    for table in report_plan_payload.get("evidence_tables", []):
+        if isinstance(table.get("rows"), list) and len(table["rows"]) > 20:
+            table["rows"] = table["rows"][:20]
+            table["context_note"] = "Bảng rút gọn cho report LLM; bảng đầy đủ vẫn nằm trong state."
+    report_plan_context = json.dumps(
+        execution_state.model_dump(mode="python"), ensure_ascii=False, indent=2, default=str
     )
     max_retries = 3
     base_delay = 2
@@ -473,7 +537,7 @@ def draft_report(state: GraphState) -> GraphState:
                 {computed_facts}
 
                 ---
-                REPORT PLAN ĐÃ KIỂM CHỨNG (KPI, analytical themes và evidence tables):
+                REPORT EXECUTION STATE ĐÃ KIỂM CHỨNG (structured state hiện tại; evidence đầy đủ được giữ ngoài prompt):
                 {report_plan_context}
 
                 ---
@@ -536,8 +600,12 @@ def draft_report(state: GraphState) -> GraphState:
                 report_draft, computed_results, analysis_insights, dataframe_profile
             )
             if unsupported_numbers:
-                raise UngroundedNumbersError(
-                    f"Báo cáo chứa số không có trong kết quả pandas đã kiểm chứng: {unsupported_numbers}"
+                removed_numbers = _strip_unsupported_report_numbers(
+                    report_draft, computed_results, analysis_insights, dataframe_profile
+                )
+                logger.warning(
+                    "Report draft chứa số ngoài evidence; đã loại token và tiếp tục: %s",
+                    removed_numbers,
                 )
 
             logger.info("LLM returned report draft sections.")
