@@ -197,8 +197,6 @@ def _frame_with_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
     header_position = max(candidates)[2] if candidates else 0
     header_row = raw.iloc[header_position]
 
-
-
     parent_row = raw.iloc[header_position - 1] if header_position > 0 else None
     parent_non_null = parent_row.dropna().astype(str).str.strip() if parent_row is not None else pd.Series(dtype="string")
     use_parent = bool(parent_row is not None and (
@@ -216,8 +214,6 @@ def _frame_with_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
         else:
             header = child or parent or f"Unnamed: {index}"
         headers.append(header)
-
-
 
     unique_headers = []
     used_headers: set[str] = set()

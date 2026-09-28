@@ -44,16 +44,6 @@ def _tables_without_visual_coverage(tables, theme_question_ids, matching_visuals
 
 
 
-
-
-
-
-
-
-
-
-
-
 def _create_pdf_report(markdown_text: str, output_path: str, visuals_by_figure=None) -> None:
     """Create the report PDF with the configured ReportLab renderer."""
     from reportlab.lib import colors
@@ -428,14 +418,6 @@ def export_report(state: GraphState) -> GraphState:
                             r"^\[[^\]]+\]\s*", "", visual_obj.description or ""
                         )
                         safe_desc = escape(visible_description)
-
-
-
-
-
-
-
-
 
 
                         embedded_visuals_html_for_this_narrative.append(

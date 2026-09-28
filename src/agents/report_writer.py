@@ -208,6 +208,17 @@ def _strip_unsupported_report_numbers(report_draft, computed_results,
     removed: list[float] = []
 
     def clean(text: str) -> str:
+        placeholders: dict[str, str] = {}
+
+        def protect_placeholder(match):
+            key = "__FIGURE_PLACEHOLDER_" + ("X" * (len(placeholders) + 1)) + "__"
+            placeholders[key] = match.group(0)
+            return key
+
+        protected = re.sub(
+            r"\[FIGURE\s+\d+\]", protect_placeholder, text or "", flags=re.IGNORECASE
+        )
+
         def replace(match):
             token = match.group(0)
             value = float(token.replace(",", ""))
@@ -216,7 +227,10 @@ def _strip_unsupported_report_numbers(report_draft, computed_results,
                 return token
             removed.append(value)
             return ""
-        return NUMBER_PATTERN.sub(replace, text or "")
+        cleaned = NUMBER_PATTERN.sub(replace, protected)
+        for key, placeholder in placeholders.items():
+            cleaned = cleaned.replace(key, placeholder)
+        return cleaned
 
     report_draft.report_subtitle = clean(report_draft.report_subtitle)
     report_draft.introduction_text = clean(report_draft.introduction_text)
@@ -264,6 +278,117 @@ def _sanitize_generic_caveats(report_draft):
         if (cleaned := _remove_generic_caveats(item))
     ]
     return report_draft
+
+
+def _draft_report_by_theme(llm, report_plan, insights, computed_results, visuals,
+                           profile_summary, instructions, dataset_name):
+    parser = JsonOutputParser(pydantic_object=ReportSectionsDraft)
+    insight_by_id = {item.insight_id: item for item in insights}
+    result_by_id = {item.question_id: item for item in computed_results}
+    merged = None
+    figure_number = 1
+    for index, theme in enumerate(report_plan.themes, start=1):
+        theme_insights = [insight_by_id[item] for item in theme.insight_ids if item in insight_by_id]
+        question_ids = list(dict.fromkeys(
+            question_id for insight in theme_insights for question_id in insight.evidence_question_ids
+        ))
+        theme_results = [result_by_id[item] for item in question_ids if item in result_by_id]
+        theme_visuals = [
+            visual for visual in visuals or []
+            if set(question_ids).intersection(visual.evidence_question_ids)
+        ]
+        facts = []
+        for item in theme_results:
+            payload = item.model_dump(mode="python")
+            if isinstance(payload.get("result"), list):
+                payload["result"] = payload["result"][:30]
+            facts.append(payload)
+        prompt = PromptTemplate(
+            template="""
+Bạn là Report Writer. Chỉ viết phần báo cáo cho một analytical theme từ evidence được cung cấp.
+Không thêm số, phép tính, quan hệ nhân quả hoặc kết luận ngoài evidence. Tạo đúng một narrative có
+dạng `Tiêu đề:- nội dung`. Mỗi visual phải xuất hiện đúng một lần bằng placeholder `[FIGURE N]` và
+được ánh xạ trong `figure_id_map`. Các trường tổng quan có thể ngắn vì sẽ được ghép với theme khác.
+
+Dataset: {dataset_name}
+Yêu cầu: {instructions}
+Schema tóm tắt: {profile_summary}
+Theme: {theme}
+Insight hợp lệ: {insights}
+Kết quả Pandas: {facts}
+Visuals: {visuals}
+
+{format_instructions}
+Chỉ trả về JSON hợp lệ.
+""",
+            input_variables=["dataset_name", "instructions", "profile_summary", "theme",
+                             "insights", "facts", "visuals"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+        logger.info("Drafting report theme %s/%s: %s", index, len(report_plan.themes), theme.title)
+        response = llm.invoke(prompt.invoke({
+            "dataset_name": dataset_name,
+            "instructions": instructions,
+            "profile_summary": profile_summary,
+            "theme": json.dumps(theme.model_dump(mode="python"), ensure_ascii=False, default=str),
+            "insights": json.dumps(
+                [item.model_dump(mode="python") for item in theme_insights],
+                ensure_ascii=False, default=str,
+            )[:40000],
+            "facts": json.dumps(facts, ensure_ascii=False, default=str)[:50000],
+            "visuals": json.dumps([
+                {"visual_id": item.visual_id, "description": item.description,
+                 "evidence_question_ids": item.evidence_question_ids}
+                for item in theme_visuals
+            ], ensure_ascii=False),
+        }), config={"request_options": {"timeout": 60}})
+        raw = text_from_response(response).strip()
+        if raw.startswith("```json") and raw.endswith("```"):
+            raw = raw[7:-3].strip()
+        draft = ReportSectionsDraft.model_validate_json(raw)
+        combined = " ".join(draft.analysis_narratives).strip()
+        if ":-" in combined:
+            _, body = combined.split(":-", 1)
+            body = body.strip()
+        else:
+            body = combined
+        if len(body) < 60:
+            evidence_text = " ".join(
+                (item.narrative or item.finding or "").strip() for item in theme_insights
+            ).strip()
+            if evidence_text:
+                body = f"{body} {evidence_text}".strip()
+        draft.analysis_narratives = [f"{theme.title}:- {body}"]
+        local_map = {}
+        for placeholder, visual_id in draft.figure_id_map.items():
+            if placeholder not in draft.analysis_narratives[0]:
+                continue
+            new_placeholder = f"[FIGURE {figure_number}]"
+            draft.analysis_narratives[0] = draft.analysis_narratives[0].replace(
+                placeholder, new_placeholder
+            )
+            local_map[new_placeholder] = visual_id
+            figure_number += 1
+        mapped_visual_ids = set(local_map.values())
+        for visual in theme_visuals:
+            if visual.visual_id in mapped_visual_ids:
+                continue
+            placeholder = f"[FIGURE {figure_number}]"
+            draft.analysis_narratives[0] += f" {placeholder} {visual.description}"
+            local_map[placeholder] = visual.visual_id
+            figure_number += 1
+        draft.figure_id_map = local_map
+        if merged is None:
+            merged = draft
+        else:
+            merged.analysis_narratives.extend(draft.analysis_narratives)
+            merged.notable_issues.extend(draft.notable_issues)
+            merged.key_takeaways_bullet_points.extend(draft.key_takeaways_bullet_points)
+            merged.figure_id_map.update(draft.figure_id_map)
+            if draft.conclusion_text:
+                merged.conclusion_text += " " + draft.conclusion_text
+            merged.clarification_questions.extend(draft.clarification_questions)
+    return merged
 
 
 def draft_report(state: GraphState) -> GraphState:
@@ -410,6 +535,38 @@ def draft_report(state: GraphState) -> GraphState:
     report_plan_context = json.dumps(
         execution_state.model_dump(mode="python"), ensure_ascii=False, indent=2, default=str
     )
+    if report_plan and report_plan.themes:
+        try:
+            report_draft = _draft_report_by_theme(
+                llm, report_plan, analysis_insights, computed_results, generated_visuals,
+                profile_summary, instructions, dataset_name,
+            )
+            report_draft = _strip_source_names_from_headings(
+                report_draft, state.get("file_path", ""), state.get("analysis_partitions")
+            )
+            report_draft = _sanitize_generic_caveats(report_draft)
+            issues = _report_completeness_issues(
+                report_draft, report_plan, analysis_insights, generated_visuals
+            )
+            if issues:
+                raise IncompleteReportError("; ".join(issues))
+            if _unsupported_report_numbers(
+                report_draft, computed_results, analysis_insights, dataframe_profile
+            ):
+                removed = _strip_unsupported_report_numbers(
+                    report_draft, computed_results, analysis_insights, dataframe_profile
+                )
+                logger.warning("Report batches chứa số ngoài evidence; đã loại: %s", removed)
+            state["report_sections_draft"] = report_draft
+            state["status"] = "report_drafted"
+            state["error_message"] = None
+            logger.info("ReportDraftingNode completed by %s theme batches.", len(report_plan.themes))
+            return state
+        except Exception as exc:
+            logger.error("Theme-batched report drafting failed: %s", exc, exc_info=True)
+            state["status"] = "error"
+            state["error_message"] = f"Theme-batched report drafting failed: {exc}"
+            return state
     max_retries = 3
     base_delay = 2
     llm_raw_output_str = ""

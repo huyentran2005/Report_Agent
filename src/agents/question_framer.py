@@ -1095,7 +1095,8 @@ Chỉ trả về JSON hợp lệ.
     selected_ids = set(parsed.selected_question_ids)
     selected = [question for question in parsed.questions if question.question_id in selected_ids]
     selected = _split_independent_group_dimensions(selected)
-    seen_plans = {_plan_signature(question) for question in selected}
+    questions_by_plan = {_plan_signature(question): question for question in selected}
+    seen_plans = set(questions_by_plan)
     known_question_ids = {question.question_id for question in parsed.questions}
     known_question_ids.update(question.question_id for question in selected)
     try:
@@ -1109,8 +1110,21 @@ Chỉ trả về JSON hợp lệ.
             )
             supplements = _split_independent_group_dimensions(supplements)
             new_questions = []
+            merged_themes = False
             for question in supplements:
-                if _plan_signature(question) in seen_plans:
+                signature = _plan_signature(question)
+                if signature in seen_plans:
+                    existing = questions_by_plan[signature]
+                    before = set(existing.theme_ids)
+                    existing.theme_ids = list(dict.fromkeys([
+                        *existing.theme_ids, *question.theme_ids,
+                    ]))
+                    if set(existing.theme_ids) != before:
+                        merged_themes = True
+                        logger.info(
+                            "Gộp themes %s vào question %s có cùng analysis plan.",
+                            question.theme_ids, existing.question_id,
+                        )
                     continue
                 base_id = question.question_id
                 suffix = 1
@@ -1118,9 +1132,10 @@ Chỉ trả về JSON hợp lệ.
                     question.question_id = f"{base_id}_{suffix}"
                     suffix += 1
                 known_question_ids.add(question.question_id)
-                seen_plans.add(_plan_signature(question))
+                seen_plans.add(signature)
+                questions_by_plan[signature] = question
                 new_questions.append(question)
-            if not new_questions:
+            if not new_questions and not merged_themes:
                 raise ValueError(
                     f"Planner chỉ tạo plan trùng khi còn thiếu themes: {missing_themes}"
                 )
