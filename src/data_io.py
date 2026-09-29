@@ -5,24 +5,10 @@ from typing import Any
 import re
 
 import pandas as pd
-from privacy import is_person_name_column
-
-
-SHEET_ROLES = {"DATA", "INSTRUCTION", "METADATA", "INVALID"}
-GENERIC_COLUMN_PATTERN = re.compile(
-    r"^(?:unnamed(?::\s*\d+)?|(?:col(?:umn)?|cot|cột|field|var|ma|mã|code|id|"
-    r"gia[\s_-]*tri|giá[\s_-]*trị|du[\s_-]*lieu|dữ[\s_-]*liệu|truong|trường)"
-    r"[\s_.-]*\d+|\d+)$",
-    re.IGNORECASE,
-)
-WEAK_SEMANTIC_PATTERN = re.compile(
-    r"^(?:cột|cot|column|field|trường|truong|mã|ma|code|id|giá trị|gia tri|"
-    r"dữ liệu|du lieu|thông tin|thong tin|nhóm|nhom)(?:[\s_.-]*\d+)?$",
-    re.IGNORECASE,
-)
 
 
 def _json_scalar(value: Any) -> Any:
+    """Chuyển một giá trị pandas/numpy thành kiểu đơn giản có thể ghi vào JSON."""
     if pd.isna(value):
         return None
     if isinstance(value, pd.Timestamp):
@@ -33,6 +19,7 @@ def _json_scalar(value: Any) -> Any:
 
 
 def _numeric_cell_ratio(frame: pd.DataFrame) -> float:
+    """Tính tỷ lệ ô không rỗng có thể chuyển đổi thành số trong toàn bộ bảng."""
     values = frame.stack(future_stack=True).dropna()
     if values.empty:
         return 0.0
@@ -40,13 +27,14 @@ def _numeric_cell_ratio(frame: pd.DataFrame) -> float:
 
 
 def _text_length(frame: pd.DataFrame) -> float:
+    """Tính độ dài trung bình của các ô văn bản không thể chuyển thành số."""
     values = frame.stack(future_stack=True).dropna()
     texts = values[~pd.to_numeric(values, errors="coerce").notna()].astype(str)
     return float(texts.str.len().mean()) if not texts.empty else 0.0
 
 
 def to_datetime_series(series: pd.Series) -> pd.Series:
-    """Parse ordinary dates and compact YYYYMMDD values without treating arbitrary integers as dates."""
+    """Chuyển cột ngày thông thường hoặc dạng YYYYMMDD thành datetime một cách thận trọng."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce")
     text = series.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
@@ -59,84 +47,60 @@ def to_datetime_series(series: pd.Series) -> pd.Series:
 
 
 def is_date_like_series(series: pd.Series, column_name: str = "") -> bool:
+    """Kiểm tra cột có kiểu ngày hoặc có ít nhất 70% giá trị chuyển được thành ngày."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
     parsed = to_datetime_series(series)
     return bool(len(series) and parsed.notna().mean() >= 0.70)
 
 
-def infer_column_semantic(series: pd.Series, column_name: str = "") -> str:
-    """Classify analytical meaning, not merely the pandas storage dtype."""
-    name = re.sub(r"[^a-z0-9]+", "_", str(column_name).lower()).strip("_")
-    values = series.dropna()
-    if _is_generic_column_name(column_name):
-        return "unknown"
-    if is_date_like_series(series, column_name):
-        return "datetime"
-    if values.empty:
-        return "unknown"
-    identifier_tokens = (
-        "id", "identifier", "code", "ma_", "_ma", "mã", "phone", "telephone",
-        "mobile", "sdt", "transaction", "account", "customer_id", "user_id",
-    )
-    if any(token in name for token in identifier_tokens):
-        return "identifier"
-    if pd.api.types.is_bool_dtype(series):
-        return "boolean/status"
-    text_values = values.astype(str).str.strip()
-    normalized = set(text_values.str.casefold().unique())
-    if normalized and normalized <= {
-        "true", "false", "yes", "no", "y", "n", "có", "không", "co", "khong",
-        "active", "inactive", "enabled", "disabled",
-    }:
-        return "boolean/status"
-    digits = text_values.str.replace(r"\D", "", regex=True)
-    if (digits.str.len().between(9, 15).mean() >= 0.90
-            and text_values.nunique() / max(len(text_values), 1) >= 0.80):
-        return "identifier"
-    if pd.api.types.is_numeric_dtype(series) or pd.to_numeric(values, errors="coerce").notna().mean() >= 0.90:
-        numeric = pd.to_numeric(values, errors="coerce").dropna()
-        if numeric.nunique() < 2:
-            return "numeric_measure"
-        return "numeric_measure"
-    unique_count = int(text_values.nunique())
-    unique_ratio = unique_count / max(len(text_values), 1)
-    if unique_count <= 30 or unique_ratio <= 0.30:
-        return "categorical"
-    if text_values.str.len().mean() >= 30:
-        return "text"
-    return "text"
+def attach_column_semantics(
+    frames: dict[str, pd.DataFrame],
+    semantics: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, pd.DataFrame]:
+    """Gắn ý nghĩa và quyền sử dụng do LLM phân loại vào từng DataFrame."""
+    for partition, frame in frames.items():
+        partition_semantics = semantics.get(partition)
+        if partition_semantics is None:
+            raise ValueError(f"Thiếu phân loại cột của partition {partition!r}.")
+        expected = {str(column) for column in frame.columns if not str(column).startswith("_")}
+        received = set(partition_semantics)
+        if expected != received:
+            raise ValueError(
+                f"Phân loại cột không khớp cho {partition!r}: "
+                f"thiếu={sorted(expected - received)}, thừa={sorted(received - expected)}."
+            )
+        incomplete = [
+            column for column, details in partition_semantics.items()
+            if not details.get("semantic_type") or not details.get("usage_permission")
+        ]
+        if incomplete:
+            raise ValueError(
+                f"Phân loại cột của {partition!r} thiếu semantic_type hoặc "
+                f"usage_permission: {sorted(incomplete)}."
+            )
+        frame.attrs["column_semantics"] = partition_semantics
+    return frames
 
 
-def _fallback_sheet_role(frame: pd.DataFrame) -> tuple[str, str]:
-    """Classify by structure/content only; sheet names are deliberately ignored."""
-    if frame.empty or len(frame.columns) == 0:
-        return "INVALID", "Sheet rỗng hoặc không có cột dữ liệu."
-    rows, columns = frame.shape
-    non_empty_ratio = float(frame.notna().sum().sum() / max(rows * columns, 1))
-    numeric_ratio = _numeric_cell_ratio(frame)
-    average_text_length = _text_length(frame)
-    active_columns = sum(
-        frame[column].notna().sum() >= max(2, rows * 0.05) for column in frame.columns
-    )
-    if columns <= 6 and rows <= 200 and average_text_length >= 30 and numeric_ratio < 0.25:
-        return "INSTRUCTION", "Cấu trúc ít cột, chủ yếu là văn bản dài mang tính hướng dẫn."
-    if columns >= 20 and non_empty_ratio < 0.30 and numeric_ratio >= 0.40:
-        return "METADATA", "Bảng rộng, thưa và chủ yếu là số tổng hợp/metadata."
-    if rows <= 3 and columns >= 2 and numeric_ratio >= 0.25:
-        return "METADATA", "Bảng nhỏ có tỷ lệ số cao, phù hợp với metadata hoặc kết quả tổng hợp có sẵn."
-    if rows >= 3 and active_columns >= 2:
-        return "DATA", "Bảng có ít nhất hai cột hoạt động và đủ hàng để phân tích."
-    return "INVALID", "Không đủ dấu hiệu cấu trúc để phân loại chắc chắn."
+def column_semantic(frame: pd.DataFrame, column: str) -> str:
+    """Lấy semantic type bắt buộc của một cột từ kết quả phân loại LLM đã gắn vào bảng."""
+    details = frame.attrs.get("column_semantics", {}).get(str(column))
+    if not details or not details.get("semantic_type"):
+        raise ValueError(f"Cột {column!r} chưa có phân loại semantic từ LLM.")
+    return str(details["semantic_type"])
 
 
-def _is_generic_column_name(name: Any) -> bool:
-    text = str(name).strip()
-    return not text or bool(GENERIC_COLUMN_PATTERN.fullmatch(text)) or bool(WEAK_SEMANTIC_PATTERN.fullmatch(text))
+def column_usage_permission(frame: pd.DataFrame, column: str) -> str:
+    """Lấy quyền sử dụng cột do LLM quyết định: đầy đủ, chỉ phân nhóm hoặc bị chặn."""
+    details = frame.attrs.get("column_semantics", {}).get(str(column))
+    if not details or not details.get("usage_permission"):
+        raise ValueError(f"Cột {column!r} chưa có phân loại quyền sử dụng từ LLM.")
+    return str(details["usage_permission"])
 
 
 def _frame_with_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
-    """Detect a plausible table header while preserving uncertain columns as UNKNOWN/generic."""
+    """Phát hiện dòng header phù hợp và giữ nguyên các header chưa xác định hoặc chung chung."""
     raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
     if raw.empty:
         return pd.DataFrame()
@@ -191,24 +155,19 @@ def _frame_with_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _read_data_sheet_with_detected_header(path: str | Path, sheet_name: str) -> pd.DataFrame:
+    """Đọc một sheet không chỉ định header rồi tự phát hiện dòng tiêu đề của bảng."""
     return _frame_with_detected_header(pd.read_excel(path, sheet_name=sheet_name, header=None))
 
 
 def inspect_workbook(path: str | Path) -> list[dict[str, Any]]:
+    """Thu thập cấu trúc, thống kê và ba dòng mẫu của từng sheet Excel."""
     source = Path(path)
     if source.suffix.lower() not in {".xlsx", ".xls"}:
         return []
     catalog: list[dict[str, Any]] = []
     for sheet_name, frame in pd.read_excel(source, sheet_name=None).items():
-        fallback_role, fallback_reason = _fallback_sheet_role(frame)
-        sensitive_columns = {
-            str(column) for column in frame.columns
-            if is_person_name_column(column, frame[column])
-            or infer_column_semantic(frame[column], str(column)) == "identifier"
-        }
         sample = [
-            {str(column): ("[REDACTED]" if str(column) in sensitive_columns and pd.notna(value)
-                           else _json_scalar(value))
+            {str(column): _json_scalar(value)
              for column, value in row.items()}
             for row in frame.head(3).to_dict(orient="records")
         ]
@@ -220,26 +179,12 @@ def inspect_workbook(path: str | Path) -> list[dict[str, Any]]:
             "numeric_cell_ratio": round(_numeric_cell_ratio(frame), 4),
             "average_text_length": round(_text_length(frame), 2),
             "sample": sample,
-            "fallback_role": fallback_role,
-            "fallback_reason": fallback_reason,
         })
     return catalog
 
 
-def fallback_sheet_classifications(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "sheet_name": item["sheet_name"],
-            "role": item["fallback_role"],
-            "reason": item["fallback_reason"],
-            "columns": item["columns"],
-            "rows": item["rows"],
-        }
-        for item in catalog
-    ]
-
-
 def _dtype_family(series: pd.Series) -> str:
+    """Xếp cột vào nhóm kiểu kỹ thuật datetime, numeric, boolean hoặc text."""
     if is_date_like_series(series):
         return "datetime"
     if pd.api.types.is_numeric_dtype(series):
@@ -253,6 +198,7 @@ def _dtype_family(series: pd.Series) -> str:
 
 
 def _schemas_compatible(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    """Kiểm tra hai bảng có đủ cột chung và kiểu tương thích để ghép theo hàng hay không."""
     left_columns = {str(column) for column in left.columns}
     right_columns = {str(column) for column in right.columns}
     shared = left_columns & right_columns
@@ -268,7 +214,7 @@ def _schemas_compatible(left: pd.DataFrame, right: pd.DataFrame) -> bool:
 
 
 def _requested_sheet_names(sheet_names: list[str], instructions: str) -> list[str]:
-    """Select sheets explicitly mentioned by the user, without assuming naming conventions."""
+    """Chọn các sheet được người dùng nhắc rõ trong yêu cầu mà không suy đoán theo tên."""
     normalized_instructions = instructions.casefold()
     requested = []
     for name in sheet_names:
@@ -285,7 +231,7 @@ def read_dataset_partitions(
     workbook_sheets: list[dict[str, Any]] | None = None,
     instructions: str = "",
 ) -> dict[str, pd.DataFrame]:
-    """Return compatible DATA sheets merged into independent schema groups."""
+    """Đọc các sheet DATA và ghép những sheet tương thích thành các nhóm schema độc lập."""
     source = Path(path)
     if source.suffix.lower() == ".csv":
         frame = _frame_with_detected_header(pd.read_csv(source, header=None))
@@ -300,8 +246,7 @@ def read_dataset_partitions(
     if workbook_sheets:
         roles = {str(item["sheet_name"]): str(item.get("role", "UNKNOWN")).upper() for item in workbook_sheets}
     else:
-        catalog = inspect_workbook(source)
-        roles = {item["sheet_name"]: item["fallback_role"] for item in catalog}
+        raise ValueError("Cần kết quả phân loại sheet từ LLM trước khi đọc workbook Excel.")
     for sheet_name in list(sheets):
         if roles.get(str(sheet_name)) == "DATA":
             sheets[sheet_name] = _read_data_sheet_with_detected_header(source, str(sheet_name))
@@ -334,7 +279,7 @@ def read_dataset_partitions(
 
 
 def split_partitions_by_source(partitions: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """Expand compatible groups so questions and calculations stay scoped to original sheets."""
+    """Tách các nhóm đã ghép về từng sheet gốc để câu hỏi và phép tính giữ đúng phạm vi."""
     per_sheet: dict[str, pd.DataFrame] = {}
     for partition_name, frame in partitions.items():
         if "_source_sheet" not in frame.columns:
@@ -346,7 +291,7 @@ def split_partitions_by_source(partitions: dict[str, pd.DataFrame]) -> dict[str,
 
 
 def _duration_role(column: str) -> str | None:
-    """Classify likely start/end datetime headers without using domain assumptions."""
+    """Nhận diện header ngày có vai trò bắt đầu hoặc kết thúc mà không giả định lĩnh vực."""
     text = re.sub(r"[^a-z0-9]+", " ", str(column).casefold()).strip()
     if re.search(r"(^| )(start|begin|created|accepted|opened|issued|from)( |$)", text):
         return "start"
@@ -359,7 +304,7 @@ def _duration_role(column: str) -> str | None:
 
 
 def _duration_metric_name(start: str, end: str, existing: pd.Index) -> str:
-    """Create a stable semantic duration name from the two source headers."""
+    """Tạo tên duy nhất và ổn định cho chỉ số thời lượng từ hai header nguồn."""
     start_text = re.sub(r"[^a-z0-9]+", " ", str(start).casefold()).strip()
     end_text = re.sub(r"[^a-z0-9]+", " ", str(end).casefold()).strip()
     pairs = (
@@ -383,11 +328,10 @@ def _duration_metric_name(start: str, end: str, existing: pd.Index) -> str:
 
 
 def add_duration_metrics(frame: pd.DataFrame) -> pd.DataFrame:
-    """Create duration metrics and hide their source datetime columns.
+    """Tạo chỉ số thời lượng và ẩn hai cột datetime nguồn khỏi bảng phân tích.
 
-    The raw workbook is never modified.  The returned analysis frame exposes
-    only the derived duration column, so downstream profiling/planning cannot
-    accidentally analyze the two source timestamps as calendar dimensions.
+    Hàm không sửa workbook gốc. Bảng trả về chỉ giữ cột thời lượng dẫn xuất để
+    các bước sau không vô tình phân tích hai timestamp nguồn như chiều lịch.
     """
     result = frame.copy()
     datetime_columns = [
@@ -420,6 +364,7 @@ def add_duration_metrics(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_dataset(path: str | Path, workbook_sheets: list[dict[str, Any]] | None = None) -> pd.DataFrame:
+    """Đọc dữ liệu và trả về một DataFrame khi tệp chỉ có đúng một nhóm schema."""
     partitions = read_dataset_partitions(path, workbook_sheets)
     if len(partitions) != 1:
         raise ValueError("Dữ liệu gồm nhiều nhóm schema độc lập; hãy dùng read_dataset_partitions().")
@@ -427,6 +372,7 @@ def read_dataset(path: str | Path, workbook_sheets: list[dict[str, Any]] | None 
 
 
 def extract_instruction_context(path: str | Path, workbook_sheets: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    """Trích văn bản từ các sheet INSTRUCTION và giới hạn độ dài để đưa vào ngữ cảnh LLM."""
     source = Path(path)
     if source.suffix.lower() not in {".xlsx", ".xls"}:
         return ""
@@ -451,13 +397,14 @@ def extract_instruction_context(path: str | Path, workbook_sheets: list[dict[str
 
 
 def describe_workbook(path: str | Path, workbook_sheets: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Trả về phân loại sheet đã có hoặc catalog cấu trúc cơ bản của workbook."""
     if workbook_sheets is not None:
         return workbook_sheets
-    catalog = inspect_workbook(path)
-    return fallback_sheet_classifications(catalog)
+    return inspect_workbook(path)
 
 
 def effective_instructions(user_instructions: str, workbook_instruction_context: str | None) -> str:
+    """Ghép yêu cầu người dùng với hướng dẫn trong workbook thành ngữ cảnh phân tích cuối."""
     if not workbook_instruction_context:
         return user_instructions
     return (

@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
+import re
 
 class DataProfile(BaseModel):
     
@@ -15,7 +16,7 @@ class DataProfile(BaseModel):
 
 class DimensionScope(BaseModel):
     column: str
-    kind: Literal["time", "category", "geography", "operation", "dimension"]
+    kind: Literal["time", "category", "dimension"]
     valid_count: int = Field(ge=0)
     unique_count: int = Field(ge=0)
     min_date: Optional[str] = None
@@ -30,6 +31,22 @@ class PartitionDataScope(BaseModel):
     source_partition: str
     row_count: int = Field(ge=0)
     dimensions: List[DimensionScope] = Field(default_factory=list)
+
+
+class ColumnSemanticClassification(BaseModel):
+    source_partition: str
+    column: str
+    semantic_type: Literal[
+        "datetime", "identifier", "numeric_measure", "categorical",
+        "boolean_status", "free_text", "person_name", "unknown",
+    ]
+    usage_permission: Literal["full_analysis", "group_only", "blocked"]
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1)
+
+
+class ColumnSemanticClassificationResponse(BaseModel):
+    columns: List[ColumnSemanticClassification]
 
 
 class QuestionDataScope(BaseModel):
@@ -47,8 +64,8 @@ class ColumnAnalysisRole(BaseModel):
     column: str
     source_partition: str
     role: Literal[
-        "time", "measure", "outcome", "driver", "category", "geography",
-        "operation", "identifier", "free_text", "sensitive", "exclude",
+        "time", "measure", "outcome", "driver", "category", "identifier",
+        "free_text", "sensitive", "exclude",
     ]
     include_in_analysis: bool = True
     rationale: str
@@ -144,6 +161,7 @@ class StructuredAnalysisPlan(BaseModel):
 
 class FramedQuestion(BaseModel):
     question_id: str = Field(description="Stable identifier such as question_1.")
+    title: str = Field(description="Declarative report heading corresponding to the question; never a question.")
     question: str = Field(description="The report question to answer.")
     operation: AnalysisOperation = Field(default="structured_plan", description="Reader-facing analysis label.")
     columns: List[str] = Field(default_factory=list, description="Exact source columns used by the plan.")
@@ -168,9 +186,24 @@ class FramedQuestion(BaseModel):
     plan: StructuredAnalysisPlan
     source_partition: Optional[str] = Field(default=None, description="Sheet or compatible sheet group to analyze.")
 
+    @field_validator("title")
+    @classmethod
+    def validate_declarative_title(cls, value):
+        title = str(value).strip()
+        if not title:
+            raise ValueError("title không được để trống")
+        if "?" in title or re.search(
+            r"\b(?:là bao nhiêu|như thế nào|vì sao|tại sao|what|why|how|which)\b",
+            title,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError("title phải là tiêu đề mô tả, không được viết dưới dạng câu hỏi")
+        return title
+
 
 class ComputedQuestionResult(BaseModel):
     question_id: str
+    title: str
     question: str
     operation: AnalysisOperation
     columns: List[str]

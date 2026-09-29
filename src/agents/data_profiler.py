@@ -4,6 +4,7 @@ import json
 import os
 import time
 import requests
+from pathlib import Path
 from typing import Dict, Any, List, Literal
 import numpy as np
 from dotenv import load_dotenv
@@ -12,15 +13,28 @@ from langchain_core.prompts import PromptTemplate
 from llm import get_llm, text_from_response
 from pydantic import BaseModel, Field, ValidationError
 from graph.state import GraphState
-from schemas.messages import DataProfile, DimensionScope, PartitionDataScope
-from privacy import is_person_name_column
-from data_io import (effective_instructions, extract_instruction_context, infer_column_semantic,
-                     fallback_sheet_classifications, inspect_workbook, is_date_like_series, read_dataset_partitions,
-                     split_partitions_by_source, to_datetime_series)
+from schemas.messages import (ColumnSemanticClassificationResponse, DataProfile,
+                              DimensionScope, PartitionDataScope)
+from data_io import (attach_column_semantics, column_semantic, column_usage_permission,
+                     effective_instructions,
+                     extract_instruction_context, inspect_workbook,
+                     read_dataset_partitions, split_partitions_by_source, to_datetime_series)
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 SHEET_CLASSIFICATION_BATCH_SIZE = 8
+COLUMN_CLASSIFICATION_BATCH_SIZE = 40
+
+
+def _basic_file_info(file_path: str, sheet_count: int = 0) -> Dict[str, Any]:
+    """Lấy metadata thực tế của file mà không đưa ra bất kỳ quyết định phân loại nào."""
+    source = Path(file_path)
+    return {
+        "file_name": source.name,
+        "extension": source.suffix.lower(),
+        "size_bytes": source.stat().st_size,
+        "sheet_count": sheet_count,
+    }
 
 class DatasetProfileResponse(BaseModel):
     """LLM only writes observations; all structural statistics stay deterministic."""
@@ -33,13 +47,12 @@ class SheetClassification(BaseModel):
     role: Literal["DATA", "INSTRUCTION", "METADATA", "INVALID"]
     reason: str
 
-
 class WorkbookClassificationResponse(BaseModel):
     sheets: List[SheetClassification]
 
 
 def _strip_json_fence(raw: str) -> str:
-    """Remove an optional Markdown fence without altering the JSON payload."""
+    """Loại bỏ Markdown fence tùy chọn mà không làm thay đổi nội dung JSON bên trong."""
     text = raw.strip()
     if text.startswith("```"):
         first_newline = text.find("\n")
@@ -51,11 +64,11 @@ def _strip_json_fence(raw: str) -> str:
 
 
 def _parse_dataset_profile_response(raw: str) -> DatasetProfileResponse:
-    """Parse model JSON while tolerating raw control characters inside strings.
+    """Parse JSON của LLM và chấp nhận ký tự điều khiển thô nằm trong chuỗi.
 
-    Some OpenAI-compatible gateways return otherwise valid JSON with literal
-    newlines, tabs, or NUL bytes in string values. Python's ``strict=False``
-    handles those values; Pydantic still validates the decoded object normally.
+    Một số gateway tương thích OpenAI có thể trả JSON chứa trực tiếp ký tự xuống
+    dòng, tab hoặc NUL. Chế độ ``strict=False`` xử lý các ký tự này, sau đó
+    Pydantic vẫn kiểm tra cấu trúc dữ liệu đã giải mã như bình thường.
     """
     payload = json.loads(_strip_json_fence(raw), strict=False)
     parsed = DatasetProfileResponse.model_validate(payload)
@@ -66,7 +79,117 @@ def _parse_dataset_profile_response(raw: str) -> DatasetProfileResponse:
     return parsed
 
 
+def _column_catalog(partitions: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
+    """Tạo thống kê thực tế của từng cột để LLM phân loại """
+    catalog: List[Dict[str, Any]] = []
+    for partition, frame in partitions.items():
+        for column in frame.columns:
+            name = str(column)
+            if name.startswith("_"):
+                continue
+            series = frame[column]
+            values = series.dropna()
+            text_values = values.astype(str).str.strip()
+            numeric = pd.to_numeric(values, errors="coerce")
+            parsed_dates = to_datetime_series(series)
+            unique_count = int(values.nunique())
+            valid_count = int(values.size)
+            item: Dict[str, Any] = {
+                "source_partition": partition,
+                "column": name,
+                "dtype": str(series.dtype),
+                "row_count": int(len(series)),
+                "valid_count": valid_count,
+                "missing_count": int(series.isna().sum()),
+                "unique_count": unique_count,
+                "unique_ratio": round(unique_count / max(valid_count, 1), 4),
+                "numeric_parse_ratio": round(float(numeric.notna().mean()), 4) if valid_count else 0.0,
+                "datetime_parse_ratio": round(float(parsed_dates.notna().mean()), 4) if len(series) else 0.0,
+                "average_text_length": round(float(text_values.str.len().mean()), 2) if valid_count else 0.0,
+            }
+            if valid_count:
+                item["sample_values"] = [str(value) for value in values.drop_duplicates().head(5)]
+            catalog.append(item)
+    return catalog
+
+
+def _classify_columns(
+    llm,
+    partitions: Dict[str, pd.DataFrame],
+    instructions: str,
+    file_info: Dict[str, Any],
+    workbook_sheets: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Yêu cầu LLM phân loại đúng một lần cho mọi cột phân tích trong các partition."""
+    catalog = _column_catalog(partitions)
+    parser = JsonOutputParser(pydantic_object=ColumnSemanticClassificationResponse)
+    prompt = PromptTemplate(
+        template="""
+Bạn đang phân loại ý nghĩa phân tích của các cột dữ liệu. Với mỗi cột, chọn đúng một nhãn:
+- datetime: mốc ngày/giờ có thể dùng làm chiều thời gian;
+- identifier: mã, số điện thoại, tài khoản hoặc khóa nhận diện không có ý nghĩa cộng/trung bình;
+- numeric_measure: đại lượng số mà tổng hợp, so sánh hoặc thống kê có ý nghĩa;
+- categorical: nhãn phân nhóm;
+- boolean_status: trạng thái nhị phân hoặc cờ;
+- free_text: văn bản tự do;
+- person_name: tên người hoặc dữ liệu trực tiếp nhận diện một cá nhân;
+- unknown: chưa đủ bằng chứng.
+
+Phân loại riêng quyền sử dụng của mỗi cột bằng `usage_permission`:
+- full_analysis: có thể dùng làm chiều phân tích, bộ lọc, phép tính hoặc số liệu phù hợp với semantic_type;
+- group_only: chỉ được dùng làm nhãn phân nhóm/group_by và hiển thị nhãn, không được dùng làm metric,
+  phép tính hoặc biến đầu vào cho transform;
+- blocked: không được đưa vào câu hỏi, phép phân tích, biểu đồ hoặc nội dung báo cáo.
+
+`semantic_type` mô tả cột là gì; `usage_permission` mô tả cột được phép dùng ra sao. Hai kết quả
+phải được quyết định độc lập. Ví dụ, tên nhân viên có thể là `person_name` + `group_only` nếu việc
+so sánh theo nhân viên phù hợp với yêu cầu; thông tin liên hệ hoặc định danh cần bảo vệ có thể là
+`identifier`/`person_name` + `blocked`. Không tự động chặn mọi `person_name`.
+
+Giữ nguyên tuyệt đối `source_partition` và `column`. Trả về đúng một mục cho mỗi cột, không thêm,
+không bỏ sót và không đổi tên cột. Không mặc định cột số là numeric_measure: nếu phép cộng hoặc
+trung bình không có ý nghĩa thì chọn identifier hoặc unknown. Chỉ dựa trên tên cột, thống kê kỹ
+thuật và mẫu an toàn được cung cấp. `confidence` nằm trong [0, 1] và `reason` phải ngắn gọn.
+
+Yêu cầu người dùng: {instructions}
+Thông tin cơ bản của file: {file_info}
+Kết quả phân loại sheet từ LLM: {workbook_sheets}
+Các cột cần phân loại: {catalog}
+{format_instructions}
+Chỉ trả về JSON hợp lệ.
+""",
+        input_variables=["instructions", "file_info", "workbook_sheets", "catalog"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+    classified: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for start in range(0, len(catalog), COLUMN_CLASSIFICATION_BATCH_SIZE):
+        batch = catalog[start:start + COLUMN_CLASSIFICATION_BATCH_SIZE]
+        expected = {(item["source_partition"], item["column"]) for item in batch}
+        raw = text_from_response(llm.invoke(prompt.invoke({
+            "instructions": instructions,
+            "file_info": json.dumps(file_info, ensure_ascii=False, indent=2),
+            "workbook_sheets": json.dumps(workbook_sheets, ensure_ascii=False, indent=2),
+            "catalog": json.dumps(batch, ensure_ascii=False, indent=2),
+        }), config={"request_options": {"timeout": 60}}))
+        parsed = ColumnSemanticClassificationResponse.model_validate_json(_strip_json_fence(raw))
+        returned = [(item.source_partition, item.column) for item in parsed.columns]
+        if len(returned) != len(set(returned)) or set(returned) != expected:
+            raise ValueError(
+                "LLM phân loại cột không khớp: "
+                f"thiếu={sorted(expected - set(returned))}, "
+                f"thừa={sorted(set(returned) - expected)}."
+            )
+        for item in parsed.columns:
+            classified[(item.source_partition, item.column)] = item.model_dump(mode="json")
+
+    result: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for (partition, column), details in classified.items():
+        result.setdefault(partition, {})[column] = details
+    return result
+
+
 def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Tạo hồ sơ thống kê cho từng cột dựa trên semantic type đã được LLM xác định."""
     details_by_column: Dict[str, Dict[str, Any]] = {}
     for col in df.columns:
         col_name = str(col)
@@ -74,19 +197,18 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             continue
         unique_values = int(df[col].nunique())
         missing_values_count = int(df[col].isnull().sum())
-        semantic_type = infer_column_semantic(df[col], col_name)
+        semantic_type = column_semantic(df, col_name)
+        usage_permission = column_usage_permission(df, col_name)
         detail: Dict[str, Any] = {
             "type": str(df[col].dtype),
             "semantic_type": semantic_type,
+            "usage_permission": usage_permission,
             "valid_count": int(df[col].notna().sum()),
             "unique_values_count": unique_values,
             "missing_values_count": missing_values_count,
             "missing_values_percentage": f"{(missing_values_count / len(df) * 100):.2f}%",
         }
-        sensitive_name = is_person_name_column(col_name, df[col])
-        if sensitive_name:
-            detail["is_sensitive_person_name"] = True
-        if is_date_like_series(df[col], col_name):
+        if semantic_type == "datetime":
             detail["type"] = "datetime"
             parsed_dates = to_datetime_series(df[col])
             detail["min"] = str(parsed_dates.min()) if parsed_dates.notna().any() else None
@@ -103,7 +225,8 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             detail["quantiles"] = {str(key): float(value) if pd.notna(value) else None for key, value in quantiles.items()}
             detail["variance"] = float(df[col].var()) if df[col].notna().sum() >= 2 else None
         elif ((pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]))
-              and not sensitive_name and semantic_type in {"categorical", "boolean/status"}):
+              and usage_permission != "blocked"
+              and semantic_type in {"categorical", "boolean_status", "person_name"}):
             counts = df[col].value_counts()
             counts.index = counts.index.infer_objects()
             top_values = counts.nlargest(5).to_dict()
@@ -113,14 +236,17 @@ def _profile_frame(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
 
 
 def _profile_data_scope(source_partition: str, df: pd.DataFrame) -> PartitionDataScope:
-    """Capture actual dimension domains without asking the LLM to infer them."""
+    """Ghi nhận phạm vi giá trị thực tế của các dimension mà không yêu cầu LLM suy đoán."""
     dimensions: list[DimensionScope] = []
     for column in df.columns:
         name = str(column)
-        if name.startswith("_") or is_person_name_column(name, df[column]):
+        if name.startswith("_"):
             continue
-        semantic = infer_column_semantic(df[column], name)
-        if is_date_like_series(df[column], name):
+        semantic = column_semantic(df, name)
+        usage_permission = column_usage_permission(df, name)
+        if usage_permission == "blocked":
+            continue
+        if semantic == "datetime":
             dates = to_datetime_series(df[column]).dropna()
             dimensions.append(DimensionScope(
                 column=name, kind="time", valid_count=int(dates.size),
@@ -130,24 +256,11 @@ def _profile_data_scope(source_partition: str, df: pd.DataFrame) -> PartitionDat
                 years=sorted(int(year) for year in dates.dt.year.unique()),
                 periods=sorted(str(period) for period in dates.dt.to_period("M").unique()),
             ))
-        elif semantic in {"categorical", "boolean/status"}:
+        elif semantic in {"categorical", "boolean_status", "person_name"}:
             values = df[column].dropna().unique().tolist()
             complete = len(values) <= 100
-            normalized = name.casefold()
-            if any(token in normalized for token in (
-                "region", "country", "city", "state", "province", "district",
-                "khu vực", "quốc gia", "tỉnh", "thành phố",
-            )):
-                kind = "geography"
-            elif any(token in normalized for token in (
-                "ship", "delivery", "channel", "method", "mode",
-                "vận chuyển", "giao hàng", "phương thức", "kênh",
-            )):
-                kind = "operation"
-            else:
-                kind = "category"
             dimensions.append(DimensionScope(
-                column=name, kind=kind, valid_count=int(df[column].notna().sum()),
+                column=name, kind="category", valid_count=int(df[column].notna().sum()),
                 unique_count=int(df[column].nunique()),
                 values=[str(value) for value in values] if complete else [],
                 values_complete=complete,
@@ -158,14 +271,12 @@ def _profile_data_scope(source_partition: str, df: pd.DataFrame) -> PartitionDat
 
 
 def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict[str, Any]]:
+    """Gửi thông tin workbook cho LLM để phân loại đầy đủ vai trò của từng sheet."""
     catalog = inspect_workbook(file_path)
     if not catalog:
         return []
-    fallback = fallback_sheet_classifications(catalog)
-    catalog_for_llm = [
-        {key: value for key, value in item.items() if key not in {"fallback_role", "fallback_reason"}}
-        for item in catalog
-    ]
+    file_info = _basic_file_info(file_path, len(catalog))
+    catalog_for_llm = catalog
     parser = JsonOutputParser(pydantic_object=WorkbookClassificationResponse)
     prompt = PromptTemplate(
         template="""
@@ -181,20 +292,16 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
         giữ nguyên `sheet_name`. Không viết mã và không thêm nhãn khác.
 
         Yêu cầu phân tích của người dùng: {instructions}
+        Thông tin cơ bản của file: {file_info}
         Thông tin các sheet: {catalog}
         {format_instructions}
         Chỉ trả về JSON hợp lệ.
         """,
-        input_variables=["instructions", "catalog"],
+        input_variables=["instructions", "file_info", "catalog"],
         partial_variables={"format_instructions": parser.get_format_instructions()},
     )
     metadata = {item["sheet_name"]: item for item in catalog}
-    fallback_by_name = {item["sheet_name"]: item for item in fallback}
     reconciled_by_name: Dict[str, Dict[str, Any]] = {}
-
-
-
-
 
     for start in range(0, len(catalog_for_llm), SHEET_CLASSIFICATION_BATCH_SIZE):
         batch = catalog_for_llm[start:start + SHEET_CLASSIFICATION_BATCH_SIZE]
@@ -202,6 +309,7 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
         try:
             raw = text_from_response(llm.invoke(prompt.invoke({
                 "instructions": user_instructions,
+                "file_info": json.dumps(file_info, ensure_ascii=False, indent=2),
                 "catalog": json.dumps(batch, ensure_ascii=False, indent=2),
             }), config={"request_options": {"timeout": 60}}))
             cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
@@ -215,35 +323,17 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
                 )
 
             for item in parsed.sheets:
-                fallback_role = fallback_by_name[item.sheet_name]["role"]
-                role = item.role
-
-
-
-                if fallback_role == "INSTRUCTION":
-                    role = "INSTRUCTION"
-                elif fallback_role == "DATA" and item.role in {"METADATA", "INVALID"}:
-                    role = "DATA"
-                reason = item.reason
-                if role != item.role:
-                    reason = (
-                        f"{reason} Vai trò được hiệu chỉnh thành {role} theo kiểm tra cấu trúc "
-                        "deterministic của toàn bộ sheet."
-                    )
                 reconciled_by_name[item.sheet_name] = {
                     "sheet_name": item.sheet_name,
-                    "role": role,
-                    "reason": reason,
+                    "role": item.role,
+                    "reason": item.reason,
                     "columns": metadata[item.sheet_name]["columns"],
                     "rows": metadata[item.sheet_name]["rows"],
                 }
         except Exception as exc:
-            logger.warning(
-                "Phân loại LLM thất bại cho lô sheet %s; chỉ dùng fallback cho lô này: %s",
-                expected, exc,
-            )
-            for sheet_name in expected:
-                reconciled_by_name[sheet_name] = fallback_by_name[sheet_name]
+            raise RuntimeError(
+                f"LLM không phân loại được lô sheet {expected}: {exc}"
+            ) from exc
 
 
 
@@ -251,6 +341,7 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
 
 
 def profile_dataset(state: GraphState) -> GraphState:
+    """Điều phối việc phân loại workbook, phân loại cột và tạo hồ sơ dữ liệu tổng thể."""
     request_id = state.get('request_id', 'unknown_request')
     file_path = state.get('file_path')
     instructions = state.get('instructions', '')
@@ -270,8 +361,6 @@ def profile_dataset(state: GraphState) -> GraphState:
         state['error_message'] = "API key for Gemini not found. Please set GEMINI_API_KEY in your .env file."
         return state
 
-
-
     try:
         llm = get_llm(state.get("llm_provider"), state.get("llm_model"))
     except Exception as e:
@@ -280,7 +369,21 @@ def profile_dataset(state: GraphState) -> GraphState:
         state['error_message'] = f"Failed to initialize LLM for data analysis: {e}"
         return state
 
-    workbook_sheets = _classify_workbook(llm, file_path, instructions)
+    try:
+        workbook_sheets = _classify_workbook(llm, file_path, instructions)
+    except Exception as exc:
+        logger.error("LLM không phân loại được workbook: %s", exc, exc_info=True)
+        state["status"] = "error"
+        state["error_message"] = f"LLM không phân loại được workbook: {exc}"
+        return state
+    file_info = _basic_file_info(file_path, len(workbook_sheets))
+    state["file_info"] = file_info
+    print("\n=== THÔNG TIN FILE VÀ PHÂN LOẠI SHEET ===")
+    print(json.dumps({
+        "file_info": file_info,
+        "workbook_sheets": workbook_sheets,
+    }, ensure_ascii=False, indent=2))
+    print("=== KẾT THÚC PHÂN LOẠI SHEET ===\n")
     if workbook_sheets:
         state["workbook_sheets"] = workbook_sheets
         workbook_context = extract_instruction_context(file_path, workbook_sheets)
@@ -296,6 +399,21 @@ def profile_dataset(state: GraphState) -> GraphState:
         logger.error(f"Error loading data for request {request_id}: {e}", exc_info=True)
         state['status'] = "error"
         state['error_message'] = f"Không thể đọc hoặc chuẩn bị dữ liệu: {e}"
+        return state
+
+    try:
+        column_semantics = _classify_columns(
+            llm, analysis_frames, instructions, file_info, workbook_sheets
+        )
+        attach_column_semantics(analysis_frames, column_semantics)
+        state["column_semantics"] = column_semantics
+        print("\n=== PHÂN LOẠI Ý NGHĨA VÀ QUYỀN SỬ DỤNG CỘT ===")
+        print(json.dumps(column_semantics, ensure_ascii=False, indent=2))
+        print("=== KẾT THÚC PHÂN LOẠI CỘT ===\n")
+    except Exception as exc:
+        logger.error("LLM không phân loại được ý nghĩa và quyền sử dụng cột: %s", exc, exc_info=True)
+        state["status"] = "error"
+        state["error_message"] = f"LLM không phân loại được ý nghĩa và quyền sử dụng cột: {exc}"
         return state
 
     sheet_profiles = {}
