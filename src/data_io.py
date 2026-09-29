@@ -135,46 +135,6 @@ def _is_generic_column_name(name: Any) -> bool:
     return not text or bool(GENERIC_COLUMN_PATTERN.fullmatch(text)) or bool(WEAK_SEMANTIC_PATTERN.fullmatch(text))
 
 
-def _apply_column_names(frame: pd.DataFrame, proposed: dict[str, str] | None = None) -> tuple[pd.DataFrame, dict[str, str]]:
-    copy = frame.copy()
-    original_names = [str(column) for column in copy.columns]
-    proposed = proposed or {}
-    used: set[str] = set()
-    renames: dict[str, str] = {}
-    final_names = []
-    for index, original in enumerate(original_names):
-        if not _is_generic_column_name(original):
-            candidate = original
-            suffix = 2
-            while candidate in used:
-                candidate = f"{original} ({suffix})"
-                suffix += 1
-            used.add(candidate)
-            final_names.append(candidate)
-            continue
-        candidate = str(proposed.get(original, "")).strip()
-        if not candidate or _is_generic_column_name(candidate):
-
-            candidate = original
-            suffix = 2
-            while candidate in used:
-                candidate = f"{original} ({suffix})"
-                suffix += 1
-            final_names.append(candidate)
-            used.add(candidate)
-            continue
-        base = candidate
-        suffix = 2
-        while candidate in used:
-            candidate = f"{base} ({suffix})"
-            suffix += 1
-        used.add(candidate)
-        final_names.append(candidate)
-        renames[original] = candidate
-    copy.columns = final_names
-    return copy, renames
-
-
 def _frame_with_detected_header(raw: pd.DataFrame) -> pd.DataFrame:
     """Detect a plausible table header while preserving uncertain columns as UNKNOWN/generic."""
     raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
@@ -234,32 +194,6 @@ def _read_data_sheet_with_detected_header(path: str | Path, sheet_name: str) -> 
     return _frame_with_detected_header(pd.read_excel(path, sheet_name=sheet_name, header=None))
 
 
-def _cross_sheet_column_renames(
-    sheets: dict[str, pd.DataFrame], data_names: list[str]
-) -> dict[str, dict[str, str]]:
-    """Infer a generic header only from consensus at the same position across DATA sheets."""
-    suggestions: dict[str, dict[str, str]] = {name: {} for name in data_names}
-    for sheet_name in data_names:
-        frame = sheets[sheet_name]
-        for position, column in enumerate(frame.columns):
-            original = str(column)
-            if not _is_generic_column_name(original):
-                continue
-            candidates = set()
-            family = _dtype_family(frame.iloc[:, position])
-            for other_name in data_names:
-                if other_name == sheet_name or position >= len(sheets[other_name].columns):
-                    continue
-                other_frame = sheets[other_name]
-                other_column = str(other_frame.columns[position])
-                if (not _is_generic_column_name(other_column)
-                        and _dtype_family(other_frame.iloc[:, position]) == family):
-                    candidates.add(other_column)
-            if len(candidates) == 1:
-                suggestions[sheet_name][original] = candidates.pop()
-    return suggestions
-
-
 def inspect_workbook(path: str | Path) -> list[dict[str, Any]]:
     source = Path(path)
     if source.suffix.lower() not in {".xlsx", ".xls"}:
@@ -300,7 +234,6 @@ def fallback_sheet_classifications(catalog: list[dict[str, Any]]) -> list[dict[s
             "reason": item["fallback_reason"],
             "columns": item["columns"],
             "rows": item["rows"],
-            "column_renames": {},
         }
         for item in catalog
     ]
@@ -357,7 +290,6 @@ def read_dataset_partitions(
     if source.suffix.lower() == ".csv":
         frame = _frame_with_detected_header(pd.read_csv(source, header=None))
         frame.columns = [str(column) for column in frame.columns]
-        frame, _ = _apply_column_names(frame)
         return {source.stem: frame}
     if source.suffix.lower() not in {".xlsx", ".xls"}:
         raise ValueError("Chỉ hỗ trợ tệp CSV, XLSX hoặc XLS.")
@@ -365,9 +297,6 @@ def read_dataset_partitions(
     sheets = pd.read_excel(source, sheet_name=None)
     for frame in sheets.values():
         frame.columns = [str(column) for column in frame.columns]
-    classification_by_name = {
-        str(item["sheet_name"]): item for item in (workbook_sheets or [])
-    }
     if workbook_sheets:
         roles = {str(item["sheet_name"]): str(item.get("role", "UNKNOWN")).upper() for item in workbook_sheets}
     else:
@@ -376,23 +305,6 @@ def read_dataset_partitions(
     for sheet_name in list(sheets):
         if roles.get(str(sheet_name)) == "DATA":
             sheets[sheet_name] = _read_data_sheet_with_detected_header(source, str(sheet_name))
-    all_data_names = [
-        str(name) for name, frame in sheets.items()
-        if roles.get(str(name)) == "DATA" and not frame.empty
-    ]
-    cross_sheet_renames = _cross_sheet_column_renames(sheets, all_data_names)
-    for sheet_name, frame in list(sheets.items()):
-        classification = classification_by_name.get(str(sheet_name), {})
-        proposed = dict(cross_sheet_renames.get(str(sheet_name), {}))
-        proposed.update({
-            original: candidate
-            for original, candidate in (classification.get("column_renames") or {}).items()
-            if candidate and not _is_generic_column_name(candidate)
-        })
-        renamed, applied = _apply_column_names(frame, proposed)
-        sheets[sheet_name] = renamed
-        if applied and classification:
-            classification["applied_column_renames"] = applied
     data_names = [str(name) for name, frame in sheets.items() if roles.get(str(name)) == "DATA" and not frame.empty]
     requested = _requested_sheet_names(data_names, instructions)
     selected_names = requested or data_names

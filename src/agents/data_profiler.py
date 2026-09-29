@@ -32,7 +32,6 @@ class SheetClassification(BaseModel):
     sheet_name: str
     role: Literal["DATA", "INSTRUCTION", "METADATA", "INVALID"]
     reason: str
-    column_renames: Dict[str, str] = Field(default_factory=dict)
 
 
 class WorkbookClassificationResponse(BaseModel):
@@ -180,14 +179,6 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
         Không suy luận vai trò chỉ từ tên sheet và không hard-code tên sheet. Hãy dựa vào cấu trúc,
         mật độ dữ liệu, kiểu nội dung và mẫu giá trị. Phải trả về đúng một mục cho mỗi sheet,
         giữ nguyên `sheet_name`. Không viết mã và không thêm nhãn khác.
-        Với mỗi cột có header rỗng hoặc generic như Unnamed, cột 1, cot 2, column 3, hãy thêm
-        `column_renames` ánh xạ tên gốc sang tên mới có ý nghĩa. Suy luận từ mẫu giá trị, kiểu dữ liệu
-        và quan hệ với các cột đã có tên. Không đổi những header vốn đã mô tả rõ nội dung.
-        Tên mới phải mô tả khái niệm thực tế của cột. Tuyệt đối không đặt tên kiểu `Cột 1`, `Cot 2`,
-        `Mã 1`, `Mã 2`, `Field 3`, `Giá trị 1`, `Dữ liệu 2` hoặc chỉ thay một nhãn generic bằng nhãn
-        generic khác. Không thêm số thứ tự để giả vờ tạo ngữ nghĩa. Nếu mẫu dữ liệu chưa đủ để xác định,
-        hãy giữ nguyên header trong file gốc, không bịa ý nghĩa nghiệp vụ. Khi suy luận, phải đối chiếu
-        mẫu dữ liệu và các cột tương ứng trên tất cả sheet DATA, không chỉ sheet hiện tại.
 
         Yêu cầu phân tích của người dùng: {instructions}
         Thông tin các sheet: {catalog}
@@ -243,7 +234,6 @@ def _classify_workbook(llm, file_path: str, user_instructions: str) -> List[Dict
                     "sheet_name": item.sheet_name,
                     "role": role,
                     "reason": reason,
-                    "column_renames": item.column_renames,
                     "columns": metadata[item.sheet_name]["columns"],
                     "rows": metadata[item.sheet_name]["rows"],
                 }
