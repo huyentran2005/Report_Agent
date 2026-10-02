@@ -10,17 +10,18 @@ from typing import Any, Dict, List, Literal
 import pandas as pd
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from agents.analysis_plan_executor import execute_analysis_plan
+from src.agents.planning.analysis_plan_executor import execute_analysis_plan
 from agents.pandas_sandbox import execute_pandas
-from data_io import (effective_instructions, infer_column_semantic, read_dataset_partitions,
-                     split_partitions_by_source, to_datetime_series)
+from data_io import (attach_column_semantics, column_semantic, column_usage_permission,
+                     effective_instructions,
+                     read_dataset_partitions, split_partitions_by_source, to_datetime_series)
 from graph.state import GraphState
 from llm import get_llm, text_from_response
-from privacy import is_person_name_column, safe_column_details
+from privacy import safe_column_details
 from schemas.messages import (AnalysisCoverageMap, ComputedQuestionResult, DataProfile,
-                              ColumnAnalysisRole, FramedQuestion, QuestionDataScope,
+                              FramedQuestion, QuestionDataScope,
                               StructuredAnalysisPlan)
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class FramedQuestionsOutput(BaseModel):
 
     @model_validator(mode="after")
     def validate_selected_questions(self):
+        """Kiểm tra ID câu hỏi duy nhất và bảo đảm mọi câu hỏi đều được chọn thực thi."""
         question_ids = [question.question_id for question in self.questions]
         if len(question_ids) != len(set(question_ids)):
             raise ValueError("Mỗi câu hỏi phải có question_id duy nhất.")
@@ -55,6 +57,9 @@ class FramedQuestionsOutput(BaseModel):
 
 class RepairedPlanOutput(BaseModel):
     plan: StructuredAnalysisPlan
+    title: str = Field(
+        description="Tiêu đề báo cáo dạng mô tả/khẳng định tương ứng với câu hỏi, không có dấu hỏi.",
+    )
     question: str | None = None
     scope: QuestionDataScope | None = None
     explanation: str = ""
@@ -74,6 +79,7 @@ MAX_PANDAS_ACTIONS = 8
 
 
 def _clean_json_response(response: str) -> str:
+    """Loại bỏ Markdown code fence bao quanh JSON do LLM trả về."""
     text = response.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -85,6 +91,7 @@ def _clean_json_response(response: str) -> str:
 
 
 def _question_columns(question: FramedQuestion) -> list[str]:
+    """Thu thập không trùng lặp mọi cột được kế hoạch của một câu hỏi tham chiếu."""
     plan = question.plan
     columns = [*plan.group_by, *plan.metrics]
     columns.extend(item.column for item in plan.filters if item.column)
@@ -94,17 +101,19 @@ def _question_columns(question: FramedQuestion) -> list[str]:
 
 
 def _sync_question_plan(question: FramedQuestion) -> None:
+    """Đồng bộ partition, danh sách cột và tên thao tác từ plan vào câu hỏi."""
     question.source_partition = question.plan.source_partition
     question.columns = _question_columns(question)
     question.operation = question.analysis_type or "structured_plan"
 
 
 def _filter_columns(question: FramedQuestion) -> set[str]:
+    """Trả về tập tên cột đang được dùng trong các điều kiện lọc của câu hỏi."""
     return {item.column for item in question.plan.filters}
 
 
 def _instruction_authorizes_filter(filter_spec, instructions: str) -> bool:
-    """Require concrete evidence in the user instruction for a requested subset."""
+    """Kiểm tra yêu cầu người dùng có nêu rõ cột, giá trị hoặc năm dùng để lọc hay không."""
     text = (instructions or "").casefold()
     values = filter_spec.value if isinstance(filter_spec.value, list) else [filter_spec.value]
     tokens = [str(value).casefold() for value in values if value is not None]
@@ -126,7 +135,7 @@ def _instruction_authorizes_filter(filter_spec, instructions: str) -> bool:
 
 
 def _validate_question_scope(df, question: FramedQuestion, instructions: str) -> None:
-    """Validate the declared scope against the executable plan and real partition."""
+    """Đối chiếu phạm vi khai báo với plan, partition thật và yêu cầu của người dùng."""
     scope = question.scope
     expected_partition = question.plan.source_partition
     if scope.source_partitions != [expected_partition]:
@@ -137,12 +146,22 @@ def _validate_question_scope(df, question: FramedQuestion, instructions: str) ->
     if unknown:
         raise ValueError(f"Scope dùng cột không tồn tại: {sorted(unknown)}")
 
-    time_columns = {
-        str(column) for column in df.columns
-        if infer_column_semantic(df[column], str(column)) == "datetime"
-    }
     declared = set(scope.time_columns) | set(scope.dimension_columns)
     filter_columns = _filter_columns(question)
+    metadata_columns = {
+        str(column) for column in {*declared, *filter_columns, *_question_columns(question)}
+        if str(column).startswith("_")
+    }
+    if metadata_columns:
+        raise ValueError(
+            f"Plan/scope không được sử dụng cột metadata nội bộ: {sorted(metadata_columns)}"
+        )
+
+    time_columns = {
+        str(column) for column in df.columns
+        if not str(column).startswith("_")
+        and column_semantic(df, str(column)) == "datetime"
+    }
     undeclared = filter_columns - declared
     if undeclared:
         raise ValueError(f"Filter chưa được khai báo trong scope: {sorted(undeclared)}")
@@ -169,7 +188,7 @@ def _validate_question_scope(df, question: FramedQuestion, instructions: str) ->
 
 
 def _order_questions(questions: List[FramedQuestion]) -> List[FramedQuestion]:
-    """Stable topological order; reject unknown dependencies and dependency cycles."""
+    """Sắp xếp câu hỏi theo phụ thuộc và từ chối ID lạ hoặc vòng lặp phụ thuộc."""
     by_id = {question.question_id: question for question in questions}
     if len(by_id) != len(questions):
         raise ValueError("question_id phải duy nhất trước khi sắp xếp phụ thuộc.")
@@ -196,7 +215,7 @@ def _order_questions(questions: List[FramedQuestion]) -> List[FramedQuestion]:
 
 
 def _remove_spurious_dependencies(questions: List[FramedQuestion]) -> None:
-    """Keep dependencies only for drill-down questions within a shared analytical theme."""
+    """Chỉ giữ dependency giữa các câu hỏi đào sâu có chung analytical theme."""
     by_id = {question.question_id: question for question in questions}
     for question in questions:
         retained = []
@@ -213,12 +232,14 @@ def _remove_spurious_dependencies(questions: List[FramedQuestion]) -> None:
 
 
 def _print_question_outcomes(answered, unanswered) -> None:
+    """In danh sách câu hỏi đã trả lời và không thể trả lời để hỗ trợ theo dõi luồng."""
     print("\n=== CÂU HỎI ĐÃ ĐƯỢC TRẢ LỜI ===")
     if not answered:
         print("(không có)")
     for question in answered:
         print(
             f"[LLM] [ĐÃ TRẢ LỜI] {question.question_id}: {question.question} "
+            f"| title={question.title} "
             f"| themes={question.theme_ids} "
             f"| depends_on={question.depends_on_question_ids or 'none'} "
             f"| plan={question.operation} | columns={question.columns} | source={question.source_partition}"
@@ -229,18 +250,16 @@ def _print_question_outcomes(answered, unanswered) -> None:
     for question, reason in unanswered:
         print(
             f"[LLM] [KHÔNG TRẢ LỜI] {question.question_id}: {question.question} "
+            f"| title={question.title} "
             f"| plan={question.operation} | lý do={reason}"
         )
     print("=== KẾT THÚC DANH SÁCH CÂU HỎI ===\n")
 
 
 def compact_computed_results(results, max_items: int = 20) -> List[Dict[str, Any]]:
-    """Bound LLM context while preserving complete computed results in graph state."""
+    """Rút gọn kết quả gửi cho LLM nhưng vẫn giữ bản đầy đủ trong graph state."""
     compacted: List[Dict[str, Any]] = []
     for item in results:
-        if any(is_person_name_column(column) for column in item.columns):
-            logger.warning("Omitting result based on a personal-name column: %s", item.columns)
-            continue
         payload = item.model_dump(mode="json")
         value = payload.get("result")
         if isinstance(value, list) and len(value) > max_items:
@@ -252,29 +271,34 @@ def compact_computed_results(results, max_items: int = 20) -> List[Dict[str, Any
 
 def _repair_plan(llm, question: FramedQuestion, error: Exception,
                  profile_context: dict[str, Any]) -> RepairedPlanOutput:
+    """Yêu cầu LLM sửa câu hỏi và plan dựa trên lỗi validation hoặc thực thi gần nhất."""
     parser = JsonOutputParser(pydantic_object=RepairedPlanOutput)
     prompt = PromptTemplate(
         template="""
 Bạn là Query Planner. Analysis plan JSON dưới đây không chạy được bằng Generic Pandas Executor.
 Quan sát lỗi và sửa cả `question` lẫn `plan` để chúng mô tả đúng cùng một phạm vi. Chỉ dùng cột trong hồ sơ, không sinh Python,
 không đổi source_partition tùy tiện và không viết nội dung ngoài JSON.
+Nếu sửa mục tiêu câu hỏi, đồng thời trả về `title` tương ứng dưới dạng cụm mô tả hoặc khẳng định;
+không viết `title` dưới dạng câu hỏi và không dùng dấu hỏi.
 Không tự đổi ý nghĩa metric theo suy đoán. Nếu hồ sơ của partition không có cột mang vai trò thời gian,
 phải loại bỏ mọi tham chiếu thời gian và không được tạo cột giả.
 Với filter thời gian, dùng mốc ISO chính xác. Một năm phải dùng khoảng nửa mở
 gte YYYY-01-01 và lt (YYYY+1)-01-01 để không loại sai bản ghi có thành phần giờ.
 
 Câu hỏi: {question}
+Tiêu đề hiện tại: {title}
 Scope hiện tại: {scope}
 Plan lỗi: {plan}
 Lỗi executor/validator: {error}
 Hồ sơ dữ liệu: {profile}
 {format_instructions}
 """,
-        input_variables=["question", "scope", "plan", "error", "profile"],
+        input_variables=["question", "title", "scope", "plan", "error", "profile"],
         partial_variables={"format_instructions": parser.get_format_instructions()},
     )
     response = text_from_response(llm.invoke(prompt.invoke({
         "question": question.question,
+        "title": question.title,
         "scope": question.scope.model_dump_json(),
         "plan": question.plan.model_dump_json(exclude_none=True),
         "error": str(error),
@@ -286,7 +310,7 @@ Hồ sơ dữ liệu: {profile}
 def _refine_dependent_plan(llm, question: FramedQuestion,
                            completed_results: dict[str, ComputedQuestionResult],
                            profile_context: dict[str, Any]) -> None:
-    """Re-plan a dependent question only after its prerequisite results are available."""
+    """Tinh chỉnh plan phụ thuộc sau khi các câu hỏi tiền đề đã có kết quả."""
     if not question.depends_on_question_ids:
         return
     parser = JsonOutputParser(pydantic_object=RepairedPlanOutput)
@@ -300,25 +324,29 @@ Bạn là Query Planner theo chuỗi. Câu hỏi hiện tại phụ thuộc vào
 Hãy quan sát chính các kết quả đó và tinh chỉnh Structured Analysis Plan để đào sâu phát hiện liên
 quan. Giữ nguyên mục tiêu câu hỏi, chỉ dùng cột trong hồ sơ, không sinh Python và không lặp nguyên
 phép tính tiền đề. Nếu plan hiện tại đã đúng thì trả lại nguyên plan.
+Giữ `title` là cụm mô tả/khẳng định tương ứng với câu hỏi, không dùng dấu hỏi.
 
 Câu hỏi phụ thuộc: {question}
+Tiêu đề hiện tại: {title}
 Plan hiện tại: {plan}
 Kết quả tiền đề: {evidence}
 Hồ sơ dữ liệu: {profile}
 {format_instructions}
 Chỉ trả về JSON hợp lệ.
 """,
-        input_variables=["question", "plan", "evidence", "profile"],
+        input_variables=["question", "title", "plan", "evidence", "profile"],
         partial_variables={"format_instructions": parser.get_format_instructions()},
     )
     response = text_from_response(llm.invoke(prompt.invoke({
         "question": question.question,
+        "title": question.title,
         "plan": question.plan.model_dump_json(exclude_none=True),
         "evidence": json.dumps(evidence, ensure_ascii=False, default=str),
         "profile": json.dumps(profile_context, ensure_ascii=False),
     }), config={"request_options": {"timeout": 60}}))
     repaired = RepairedPlanOutput.model_validate_json(_clean_json_response(response))
     question.plan = repaired.plan
+    question.title = repaired.title
     if repaired.scope:
         question.scope = repaired.scope
     if repaired.question:
@@ -326,11 +354,11 @@ Chỉ trả về JSON hợp lệ.
 
 
 def _validate_time_scope(df, question: FramedQuestion, instructions: str) -> None:
-    """Reject LLM-invented time windows that exclude available periods."""
+    """Từ chối khoảng thời gian do LLM tự giới hạn khi người dùng không yêu cầu."""
     date_filters = []
     for filter_spec in question.plan.filters:
-        if filter_spec.column in df.columns and infer_column_semantic(
-            df[filter_spec.column], filter_spec.column
+        if filter_spec.column in df.columns and column_semantic(
+            df, filter_spec.column
         ) == "datetime":
             date_filters.append(filter_spec)
     if not date_filters:
@@ -396,15 +424,41 @@ def _validate_time_scope(df, question: FramedQuestion, instructions: str) -> Non
 
 def _execute_question_with_actions(llm, df: pd.DataFrame,
                                    question: FramedQuestion) -> ComputedQuestionResult:
-    """Let the planner inspect, execute Pandas, observe, and finish iteratively."""
+    """Cho planner lặp qua các action quan sát, chạy Pandas và hoàn tất câu trả lời."""
+    if any(column_usage_permission(df, column) == "group_only"
+           for column in question.plan.group_by):
+        result, calculation, _ = execute_analysis_plan(df, question.plan)
+        return ComputedQuestionResult(
+            question_id=question.question_id, title=question.title,
+            question=question.question,
+            operation=question.operation, columns=question.columns,
+            parameters={
+                "analysis_type": question.analysis_type,
+                "expected_result": question.expected_result,
+                "visualization": question.visualization,
+                "theme_ids": question.theme_ids,
+                "data_scope": question.scope.model_dump(mode="json"),
+                "analysis_plan": question.plan.model_dump(mode="json", exclude_none=True),
+                "permission_enforced_executor": True,
+            },
+            result=result, calculation=calculation,
+            source_partition=question.source_partition,
+        )
     parser = JsonOutputParser(pydantic_object=PandasPlannerAction)
     history: list[dict[str, Any]] = []
     latest_result: Any = None
     latest_code: str | None = None
+    safe_columns = [
+        column for column in df.columns
+        if not str(column).startswith("_")
+        and column_usage_permission(df, str(column)) == "full_analysis"
+    ]
+    analysis_df = df[safe_columns].copy()
     schema = [
-        {"name": str(column), "dtype": str(df[column].dtype),
-         "semantic_type": infer_column_semantic(df[column], str(column))}
-        for column in df.columns if not str(column).startswith("_")
+        {"name": str(column), "dtype": str(analysis_df[column].dtype),
+         "semantic_type": column_semantic(df, str(column)),
+         "usage_permission": column_usage_permission(df, str(column))}
+        for column in analysis_df.columns
     ]
     prompt = PromptTemplate(
         template="""
@@ -439,15 +493,16 @@ Lịch sử action-observation: {history}
         }), config={"request_options": {"timeout": 60}}))
         action = PandasPlannerAction.model_validate_json(_clean_json_response(raw))
         if action.action == "inspect_schema":
-            observation = {"schema": schema, "row_count": len(df)}
+            observation = {"schema": schema, "row_count": len(analysis_df)}
         elif action.action == "sample_rows":
-            observation = {"rows": df.head(5).astype(object).where(pd.notna(df.head(5)), None).to_dict("records")}
+            sample = analysis_df.head(5)
+            observation = {"rows": sample.astype(object).where(pd.notna(sample), None).to_dict("records")}
         elif action.action == "execute_pandas":
             if not action.code:
                 observation = {"error": "execute_pandas yêu cầu trường code."}
             else:
                 try:
-                    latest_result = execute_pandas(action.code, df)
+                    latest_result = execute_pandas(action.code, analysis_df)
                     latest_code = action.code
                     observation = {"result": latest_result}
                 except Exception as exc:
@@ -457,7 +512,8 @@ Lịch sử action-observation: {history}
                 observation = {"error": "Chưa có kết quả execute_pandas để hoàn tất."}
             else:
                 return ComputedQuestionResult(
-                    question_id=question.question_id, question=question.question,
+                    question_id=question.question_id, title=question.title,
+                    question=question.question,
                     operation=question.operation, columns=question.columns,
                     parameters={
                         "analysis_type": question.analysis_type,
@@ -478,7 +534,8 @@ Lịch sử action-observation: {history}
             MAX_PANDAS_ACTIONS,
         )
         return ComputedQuestionResult(
-            question_id=question.question_id, question=question.question,
+            question_id=question.question_id, title=question.title,
+            question=question.question,
             operation=question.operation, columns=question.columns,
             parameters={
                 "analysis_type": question.analysis_type,
@@ -495,7 +552,8 @@ Lịch sử action-observation: {history}
     try:
         fallback_result, fallback_code, _ = execute_analysis_plan(df, question.plan)
         return ComputedQuestionResult(
-            question_id=question.question_id, question=question.question,
+            question_id=question.question_id, title=question.title,
+            question=question.question,
             operation=question.operation, columns=question.columns,
             parameters={
                 "analysis_type": question.analysis_type,
@@ -518,6 +576,7 @@ Lịch sử action-observation: {history}
 
 def _execute_with_revision(llm, question: FramedQuestion, partitions,
                            profile_context: dict[str, Any], instructions: str) -> ComputedQuestionResult:
+    """Thực thi câu hỏi và yêu cầu LLM sửa plan trong giới hạn số lần cho phép."""
     last_error: Exception | None = None
     for attempt in range(MAX_PLAN_REVISIONS + 1):
         _sync_question_plan(question)
@@ -539,6 +598,7 @@ def _execute_with_revision(llm, question: FramedQuestion, partitions,
             logger.warning("Plan %s lỗi lần %s; yêu cầu LLM sửa: %s", question.question_id, attempt + 1, exc)
             repaired = _repair_plan(llm, question, exc, profile_context)
             question.plan = repaired.plan
+            question.title = repaired.title
             if repaired.scope:
                 question.scope = repaired.scope
             if repaired.question:
@@ -547,11 +607,12 @@ def _execute_with_revision(llm, question: FramedQuestion, partitions,
 
 
 def _plan_signature(question: FramedQuestion) -> str:
+    """Tạo chữ ký JSON ổn định để nhận biết nội dung plan của một câu hỏi."""
     return question.plan.model_dump_json(exclude_none=True)
 
 
 def _split_independent_group_dimensions(questions: List[FramedQuestion]) -> List[FramedQuestion]:
-    """Turn a multi-category cross-tab into one independent analysis per dimension."""
+    """Tách plan có nhiều dimension độc lập thành một phân tích cho mỗi dimension."""
     expanded: List[FramedQuestion] = []
     used_ids = {question.question_id for question in questions}
     dependency_expansions: dict[str, list[str]] = {}
@@ -573,6 +634,7 @@ def _split_independent_group_dimensions(questions: List[FramedQuestion]) -> List
                     suffix += 1
                 used_ids.add(split.question_id)
             split.plan.group_by = [dimension]
+            split.title = f"{metrics_label} theo {dimension}"
             split.question = f"Hiệu suất {metrics_label} theo {dimension}?"
             filter_columns = {item.column for item in split.plan.filters}
             split.scope.dimension_columns = [
@@ -595,12 +657,13 @@ def _split_independent_group_dimensions(questions: List[FramedQuestion]) -> List
 
 
 def _build_coverage_map(llm, profile_context: dict[str, Any], instructions: str) -> AnalysisCoverageMap:
+    """Yêu cầu LLM lập bản đồ vai trò cột và các analytical theme cần bao phủ."""
     parser = JsonOutputParser(pydantic_object=AnalysisCoverageMap)
     compact_profiles: dict[str, Any] = {}
     detail_keys = {
-        "type", "semantic_type", "dtype", "unique_values_count",
+        "type", "semantic_type", "usage_permission", "dtype", "unique_values_count",
         "missing_values_count", "min", "max", "mean", "std",
-        "top_5_values", "years", "is_sensitive_person_name",
+        "top_5_values", "years",
     }
     for partition, profile in profile_context.items():
         details = profile.get("column_details") or {}
@@ -647,9 +710,15 @@ Không gán ý nghĩa nghiệp vụ cụ thể cho metric nếu tên cột, tên
 
 Trong từng partition, gán mỗi cột vào đúng một vai trò:
 
-`time`, `measure`, `outcome`, `driver`, `category`, `geography`, `operation`, `identifier`, `free_text`, `sensitive`, `exclude`.
+`time`, `measure`, `outcome`, `driver`, `category`, `identifier`, `free_text`, `sensitive`, `exclude`.
 
 Quy tắc:
+
+- Tuân thủ `usage_permission` đã có trong hồ sơ: `blocked` luôn phải có role `exclude`, không xuất
+  hiện trong theme; `group_only` phải có role `category` khi được chọn phân tích và chỉ được dùng làm
+  dimension phân nhóm. Khi `include_in_analysis=false`, role vẫn có thể mô tả bản chất của cột nhưng
+  cột không được xuất hiện trong theme. Cột `group_only` không được làm metric, outcome, driver hay
+  đầu vào phép tính; `full_analysis` được dùng phù hợp với `semantic_type`.
 
 - `identifier`: ID, mã bản ghi hoặc khóa kỹ thuật; không dùng làm dimension nếu gần như unique.
 - `category`: giá trị có tính phân nhóm/so sánh và có lặp lại.
@@ -666,7 +735,7 @@ Từ các cột hợp lệ, tạo bộ **analytical themes nhỏ nhất nhưng �
 Ưu tiên yêu cầu phân tích trong `instructions`: nếu người dùng đã nêu các mục tiêu cụ thể, chỉ tạo
 theme cho các mục tiêu đó và các dimension được nêu hoặc bắt buộc để trả lời chúng. Không tự mở rộng
 thành danh sách phân tích phổ biến của lĩnh vực. Mỗi theme chỉ có **một dimension phân tích chính**
-(một cột time/category/geography/operation/driver) và một hoặc nhiều metric liên quan; không tạo
+(một cột time/category/driver) và một hoặc nhiều metric liên quan; không tạo
 theme có tiêu đề hoặc columns gộp nhiều dimension độc lập. Nếu một yêu cầu có nhiều dimension, tạo
 một theme riêng cho từng dimension ngay từ đầu, không tạo theme lai rồi chờ bước sau tách.
 
@@ -688,6 +757,19 @@ Không:
 - tạo theme chỉ để tăng coverage.
 
 Ngược lại, nhiều metric có thể cùng thuộc một theme nếu chúng cùng đánh giá một dimension. Không gộp các dimension khác bản chất chỉ vì chúng sử dụng chung metric.
+
+Không sao chép toàn bộ `numeric_measure` vào mọi theme.
+
+Mỗi metric chỉ được đưa vào theme khi thỏa ít nhất một điều kiện:
+
+1. Người dùng yêu cầu trực tiếp quan hệ giữa dimension và metric đó; hoặc
+2. Có quan hệ phân tích trực tiếp, giải thích được từ tên cột, semantic type, thống kê dữ liệu và
+   ngữ cảnh yêu cầu.
+
+Nếu dimension không có metric liên quan rõ ràng, chỉ tạo theme đếm số bản ghi theo dimension khi
+phép đếm đó có giá trị đối với yêu cầu; nếu không thì không tạo theme. Không tạo nhiều theme có cùng
+một tập metric bằng cách chỉ thay dimension. Không đưa metric vào theme chỉ vì metric đó tồn tại,
+có kiểu số hoặc đang được dùng trong một theme khác.
 
 Nếu dimension có cardinality cao nhưng vẫn có ý nghĩa phân tích, giữ theme đó. Việc giới hạn **Top N** được xử lý ở bước phân tích/visualization sau này.
 
@@ -747,38 +829,41 @@ Chỉ trả về **JSON hợp lệ** đúng schema `AnalysisCoverageMap`. Không
 
 
 def _validate_coverage_map(coverage_map: AnalysisCoverageMap, partitions) -> None:
-    role_keys = {(item.source_partition, item.column) for item in coverage_map.column_roles}
-    for partition, frame in partitions.items():
-        for column in frame.columns:
-            column = str(column)
-            key = (partition, column)
-            if column.startswith("_") or key in role_keys or is_person_name_column(column, frame[column]):
-                continue
-            semantic = infer_column_semantic(frame[column], column)
-            role = {
-                "datetime": "time",
-                "numeric_measure": "measure",
-                "categorical": "category",
-                "boolean/status": "category",
-                "identifier": "identifier",
-            }.get(semantic, "free_text")
-            coverage_map.column_roles.append(ColumnAnalysisRole(
-                column=column,
-                source_partition=partition,
-                role=role,
-                include_in_analysis=role not in {"free_text", "identifier"},
-                rationale="Bổ sung tự động từ schema/dtype vì LLM không liệt kê cột này.",
-            ))
+    """Kiểm tra coverage map đủ cột, đúng partition và tuân thủ quyền sử dụng cột."""
     role_keys = [(item.source_partition, item.column) for item in coverage_map.column_roles]
     if len(role_keys) != len(set(role_keys)):
         raise ValueError("Coverage map phân loại trùng một cột.")
     expected = {
         (partition, str(column)) for partition, frame in partitions.items() for column in frame.columns
-        if not str(column).startswith("_") and not is_person_name_column(column, frame[column])
+        if not str(column).startswith("_")
     }
     missing_roles = expected - set(role_keys)
     if missing_roles:
         raise ValueError(f"Coverage map chưa phân loại các cột: {sorted(missing_roles)}")
+    for item in coverage_map.column_roles:
+        if item.source_partition not in partitions:
+            raise ValueError(
+                f"Coverage role của cột {item.column!r} dùng source_partition không tồn tại."
+            )
+        frame = partitions[item.source_partition]
+        if item.column not in frame.columns:
+            raise ValueError(f"Coverage role dùng cột không tồn tại: {item.column!r}")
+        permission = column_usage_permission(frame, item.column)
+        if permission == "blocked" and (item.role != "exclude" or item.include_in_analysis):
+            raise ValueError(
+                f"Cột {item.column!r} có usage_permission=blocked nên phải có role=exclude "
+                "và include_in_analysis=false."
+            )
+        if permission == "group_only":
+            if item.include_in_analysis and item.role != "category":
+                raise ValueError(
+                    f"Cột {item.column!r} có usage_permission=group_only nên khi sử dụng "
+                    "phải có role=category."
+                )
+    role_by_key = {
+        (item.source_partition, item.column): item
+        for item in coverage_map.column_roles
+    }
     for theme in coverage_map.themes:
         if theme.source_partition not in partitions:
             raise ValueError(f"Theme {theme.theme_id} dùng source_partition không tồn tại.")
@@ -786,15 +871,30 @@ def _validate_coverage_map(coverage_map: AnalysisCoverageMap, partitions) -> Non
                    if column not in partitions[theme.source_partition].columns]
         if unknown:
             raise ValueError(f"Theme {theme.theme_id} dùng cột không tồn tại: {unknown}")
+        frame = partitions[theme.source_partition]
+        blocked = [
+            column for column in theme.columns
+            if column_usage_permission(frame, column) == "blocked"
+        ]
+        if blocked:
+            raise ValueError(f"Theme {theme.theme_id} dùng cột đã bị LLM chặn: {blocked}")
+        excluded = [
+            column for column in theme.columns
+            if not role_by_key[(theme.source_partition, column)].include_in_analysis
+        ]
+        if excluded:
+            raise ValueError(
+                f"Theme {theme.theme_id} dùng cột có include_in_analysis=false: {excluded}"
+            )
 
 
 def _split_multidimension_themes(coverage_map: AnalysisCoverageMap) -> None:
-    """Ensure independent business dimensions remain independent coverage units."""
+    """Tách theme chứa nhiều dimension độc lập thành các đơn vị coverage riêng."""
     role_by_column = {
         (item.source_partition, item.column): item.role
         for item in coverage_map.column_roles
     }
-    dimension_roles = {"time", "category", "geography", "operation", "driver"}
+    dimension_roles = {"time", "category", "driver"}
     used_ids = {theme.theme_id for theme in coverage_map.themes}
     normalized = []
     for theme in coverage_map.themes:
@@ -826,12 +926,13 @@ def _split_multidimension_themes(coverage_map: AnalysisCoverageMap) -> None:
 
 def _covered_columns_by_theme(coverage_map: AnalysisCoverageMap,
                               questions: List[FramedQuestion]) -> dict[str, set[str]]:
+    """Xác định những cột của từng theme thực sự được các plan câu hỏi sử dụng."""
     known = {theme.theme_id: theme for theme in coverage_map.themes}
     role_by_column = {
         (item.source_partition, item.column): item.role
         for item in coverage_map.column_roles
     }
-    dimension_roles = {"time", "category", "geography", "operation", "driver"}
+    dimension_roles = {"time", "category", "driver"}
     for question in questions:
         unknown = set(question.theme_ids) - set(known)
         if unknown:
@@ -865,6 +966,7 @@ def _covered_columns_by_theme(coverage_map: AnalysisCoverageMap,
 
 def _missing_required_themes(coverage_map: AnalysisCoverageMap,
                              questions: List[FramedQuestion]) -> list[str]:
+    """Liệt kê các theme bắt buộc chưa được bất kỳ câu hỏi nào bao phủ thực tế."""
     known = {theme.theme_id: theme for theme in coverage_map.themes}
     required = {theme.theme_id for theme in coverage_map.themes if theme.required}
     columns_by_theme = _covered_columns_by_theme(coverage_map, questions)
@@ -877,7 +979,7 @@ def _missing_required_themes(coverage_map: AnalysisCoverageMap,
 
 def _validate_plan_scope_coverage(questions: List[FramedQuestion], partitions,
                                   instructions: str) -> None:
-    """Validate requested partition coverage and only requested temporal coverage."""
+    """Kiểm tra câu hỏi bao phủ đủ partition và phạm vi thời gian mà người dùng yêu cầu."""
     instruction_text = (instructions or "").casefold()
     temporal_request = bool(re.search(
         r"\b(?:time|trend|trend_over_time|temporal|year|month|quarter|week|day|date|growth|"
@@ -900,13 +1002,16 @@ def _validate_plan_scope_coverage(questions: List[FramedQuestion], partitions,
         frame = partitions[partition_name]
         numeric_columns = [
             str(column) for column in frame.columns
-            if infer_column_semantic(frame[column], str(column)) == "numeric_measure"
+            if not str(column).startswith("_")
+            and column_semantic(frame, str(column)) == "numeric_measure"
         ]
         if not numeric_columns:
             continue
         for column in frame.columns:
             name = str(column)
-            if infer_column_semantic(frame[column], name) != "datetime":
+            if name.startswith("_"):
+                continue
+            if column_semantic(frame, name) != "datetime":
                 continue
             dates = to_datetime_series(frame[column]).dropna()
             if dates.dt.year.nunique() < 2:
@@ -928,6 +1033,7 @@ def _validate_plan_scope_coverage(questions: List[FramedQuestion], partitions,
 def _supplement_questions(llm, coverage_map: AnalysisCoverageMap,
                           questions: List[FramedQuestion], missing_theme_ids: list[str],
                           profile_context: dict[str, Any], instructions: str) -> List[FramedQuestion]:
+    """Yêu cầu LLM bổ sung câu hỏi cho các theme bắt buộc còn thiếu coverage."""
     parser = JsonOutputParser(pydantic_object=CoverageSupplementOutput)
     themes = {theme.theme_id: theme.model_dump(mode="json") for theme in coverage_map.themes}
     prompt = PromptTemplate(
@@ -939,6 +1045,8 @@ tính là bao phủ. Một câu hỏi được phép bao
 phủ nhiều theme liên quan và nhiều metric trong cùng source_partition. Không lặp câu hiện có,
 không sinh Python; mỗi câu phải có theme_ids và Structured Analysis Plan thực thi được. Nếu dùng
 depends_on_question_ids, chỉ tham chiếu question_id trong danh sách câu hỏi hiện có.
+Mỗi câu hỏi phải có `title` tương ứng: một cụm tiêu đề mô tả hoặc khẳng định dùng cho báo cáo,
+không phải câu hỏi, không có dấu `?` và không dùng từ hỏi.
 Mỗi câu phải khai báo `scope`: mặc định coverage_mode=full_dataset, source_partitions chứa đúng
 source_partition của plan, và không dùng filter. Chỉ dùng user_requested_subset khi filter được yêu
 cầu rõ trong yêu cầu người dùng; analytical_subset chỉ dành cho drill-down có dependency và rationale.
@@ -966,6 +1074,7 @@ Chỉ trả về JSON hợp lệ.
 
 
 def frame_questions(state: GraphState) -> GraphState:
+    """Điều phối việc tạo, kiểm tra, sửa và thực thi bộ câu hỏi phân tích từ graph state."""
     if not state.get("dataframe_profile"):
         state["status"] = "error"
         state["error_message"] = "Cannot frame questions without a dataframe profile."
@@ -974,6 +1083,7 @@ def frame_questions(state: GraphState) -> GraphState:
         partitions = split_partitions_by_source(read_dataset_partitions(
             state["file_path"], state.get("workbook_sheets"), state.get("instructions", "")
         ))
+        attach_column_semantics(partitions, state.get("column_semantics") or {})
     except Exception as exc:
         state["status"] = "error"
         state["error_message"] = f"Cannot execute framed questions: {exc}"
@@ -1025,6 +1135,9 @@ Bạn là Question Planner. Dựa trên Analysis Coverage Map đã được lậ
 nhất nhưng bao phủ tất cả theme có required=true. Không đặt câu hỏi theo từng cột máy móc. Một câu
 hỏi có thể bao phủ nhiều theme liên quan và nhiều metric trong cùng source_partition, chẳng hạn so
 sánh đồng thời hai chỉ số kết quả theo một dimension. Mỗi câu bắt buộc khai báo `theme_ids`.
+Với mỗi `question`, phải tạo đồng thời `title` tương ứng dùng làm tên mục trong báo cáo. `question`
+được phép ở dạng câu hỏi; `title` phải là cụm mô tả hoặc câu khẳng định ngắn gọn, không có dấu `?`,
+không dùng từ hỏi và không chứa tên file, sheet hay source_partition.
 `instructions` là yêu cầu phân tích chính của người dùng. Hãy bóc tách yêu cầu thành các câu hỏi nhỏ,
 mỗi câu trả lời một quan hệ phân tích nguyên tử hoặc một nhóm metric dùng chung một dimension. Giữ
 đúng phạm vi, metric, dimension và điều kiện mà người dùng yêu cầu; không gom các dimension độc lập
@@ -1060,9 +1173,11 @@ Pandas Executor bằng cách kết hợp:
   rolling_mean, correlation, distribution, outlier_iqr, round;
 - sort và limit cho top/bottom N.
 
-Mỗi plan chỉ dùng một source_partition và tên cột chính xác trong hồ sơ. Chỉ dùng numeric_measure
-cho tổng hợp số/correlation. Không dùng identifier, số điện thoại, mã giao dịch, tên người, text
-hoặc unknown làm measurement. Không chọn phép tính khi dữ liệu hợp lệ không đủ. Đặt analysis_type
+Mỗi plan chỉ dùng một source_partition và tên cột chính xác trong hồ sơ. Tuân thủ `usage_permission`:
+không dùng cột `blocked`; cột `group_only` chỉ được đặt trong `group_by`; cột `full_analysis` được
+dùng theo `semantic_type`. Chỉ dùng numeric_measure cho tổng hợp số/correlation. Không dùng identifier,
+số điện thoại, mã giao dịch, tên người, text hoặc unknown làm measurement. Không chọn phép tính khi dữ
+liệu hợp lệ không đủ. Đặt analysis_type
 là nhãn ngắn mô tả đúng phép phân tích, visualization nếu hữu ích, và
 Chỉ đưa vào `questions` những câu hỏi thực sự phục vụ báo cáo và bắt buộc
 `selected_question_ids` chứa toàn bộ question_id trong `questions`.

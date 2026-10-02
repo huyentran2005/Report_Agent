@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 def _theme_for_result(item) -> tuple[str, str]:
-    title = (item.question or "").strip().rstrip("?").strip()
+    title = (item.title or "").strip()
     purpose = str(item.parameters.get("expected_result") or "").strip()
     if not title or not purpose:
         raise ValueError(
-            f"Kết quả {item.question_id} thiếu question/expected_result để lập report theme."
+            f"Kết quả {item.question_id} thiếu thông tin plan/expected_result để lập report theme."
         )
     return title, purpose
 

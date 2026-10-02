@@ -1,14 +1,12 @@
 """Validate and execute declarative analysis plans with Pandas."""
 from __future__ import annotations
 
-from datetime import date, datetime
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from data_io import infer_column_semantic, to_datetime_series
-from privacy import is_person_name_column
+from data_io import column_semantic, column_usage_permission, to_datetime_series
 from schemas.messages import AnalysisFilter, AnalysisTransform, StructuredAnalysisPlan
 
 
@@ -59,20 +57,39 @@ def validate_analysis_plan(df: pd.DataFrame, plan: StructuredAnalysisPlan) -> li
     metadata = [column for column in columns if str(column).startswith("_")]
     if metadata:
         raise InvalidAnalysisPlan(f"Không được phân tích cột metadata: {metadata}")
-    sensitive = [column for column in columns if is_person_name_column(column, df[column])]
-    if sensitive:
-        raise InvalidAnalysisPlan(f"Không được phân tích cột tên cá nhân: {sensitive}")
+    blocked = [column for column in columns if column_usage_permission(df, column) == "blocked"]
+    if blocked:
+        raise InvalidAnalysisPlan(f"LLM đã chặn quyền sử dụng các cột: {blocked}")
+    restricted_references = [*plan.metrics]
+    restricted_references.extend(item.column for item in plan.filters if item.column)
+    for transform in plan.transforms:
+        restricted_references.extend(
+            value for value in (transform.column, transform.numerator, transform.denominator) if value
+        )
+    group_only_misuse = list(dict.fromkeys(
+        column for column in restricted_references
+        if column_usage_permission(df, column) == "group_only"
+    ))
+    if group_only_misuse:
+        raise InvalidAnalysisPlan(
+            "Các cột group_only chỉ được xuất hiện trong group_by, không được dùng làm "
+            f"metric, filter hoặc transform: {group_only_misuse}"
+        )
     if not plan.group_by and not plan.metrics and not plan.transforms:
         raise InvalidAnalysisPlan("Plan phải có group_by, metrics hoặc transform phân tích.")
     if plan.time_grain:
         if not plan.group_by:
             raise InvalidAnalysisPlan("time_grain yêu cầu ít nhất một cột group_by thời gian.")
+        if column_semantic(df, plan.group_by[0]) != "datetime":
+            raise InvalidAnalysisPlan(
+                f"Cột {plan.group_by[0]!r} không được LLM phân loại là datetime."
+            )
         parsed = to_datetime_series(df[plan.group_by[0]])
         if parsed.notna().mean() < 0.7:
             raise InvalidAnalysisPlan(f"Cột {plan.group_by[0]!r} không đủ dữ liệu thời gian hợp lệ.")
     if plan.aggregation in _NUMERIC_AGGREGATIONS:
         invalid = [column for column in plan.metrics
-                   if infer_column_semantic(df[column], column) != "numeric_measure"]
+                   if column_semantic(df, column) != "numeric_measure"]
         if invalid:
             raise InvalidAnalysisPlan(f"Aggregation {plan.aggregation} yêu cầu numeric_measure: {invalid}")
     return columns
@@ -81,13 +98,7 @@ def validate_analysis_plan(df: pd.DataFrame, plan: StructuredAnalysisPlan) -> li
 def _apply_filter(work: pd.DataFrame, spec: AnalysisFilter) -> pd.DataFrame:
     series = work[spec.column]
     op, value = spec.operator, spec.value
-    is_datetime = (
-        pd.api.types.is_datetime64_any_dtype(series)
-        or infer_column_semantic(series, spec.column) == "datetime"
-        or series.dropna().map(
-            lambda item: isinstance(item, (date, datetime, pd.Timestamp, np.datetime64))
-        ).mean() >= 0.7
-    )
+    is_datetime = column_semantic(work, spec.column) == "datetime"
     if is_datetime:
         series = to_datetime_series(series)
         if op == "between" and isinstance(value, list):

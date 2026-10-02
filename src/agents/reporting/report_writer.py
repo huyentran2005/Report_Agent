@@ -12,8 +12,7 @@ from pydantic import BaseModel, Field, ValidationError
 from graph.state import GraphState
 from schemas.messages import ReportSectionsDraft
 from data_io import effective_instructions
-from privacy import is_person_name_column
-from agents.report_execution_state import build_report_execution_state
+from src.agents.reporting.report_execution_state import build_report_execution_state
 
 logger = logging.getLogger(__name__)
 NUMBER_PATTERN = re.compile(r"(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?")
@@ -29,9 +28,9 @@ class IncompleteReportError(ValueError):
 
 def _report_completeness_issues(report_draft, report_plan, insights, visuals):
     """Verify that every planned theme has meaningful prose and the correct charts."""
-    if not report_plan:
-        return []
     issues = []
+    if not report_plan:
+        return issues
     narratives = report_draft.analysis_narratives
     if len(narratives) != len(report_plan.themes):
         issues.append(
@@ -309,6 +308,8 @@ Bạn là Report Writer. Chỉ viết phần báo cáo cho một analytical them
 Không thêm số, phép tính, quan hệ nhân quả hoặc kết luận ngoài evidence. Tạo đúng một narrative có
 dạng `Tiêu đề:- nội dung`. Mỗi visual phải xuất hiện đúng một lần bằng placeholder `[FIGURE N]` và
 được ánh xạ trong `figure_id_map`. Các trường tổng quan có thể ngắn vì sẽ được ghép với theme khác.
+Tiêu đề phải là cụm mô tả hoặc kết luận khẳng định, tuyệt đối không viết dưới dạng câu hỏi và không
+dùng dấu hỏi.
 
 Dataset: {dataset_name}
 Yêu cầu: {instructions}
@@ -456,17 +457,19 @@ def draft_report(state: GraphState) -> GraphState:
             "Schema dữ liệu (chỉ gồm tên cột và kiểu dữ liệu):\n"
         )
         sheets = state.get("workbook_sheets") or []
+        column_semantics = state.get("column_semantics") or {}
         if sheets:
             sheet_schema = [
                 {"sheet_name": sheet.get("sheet_name"), "columns": [
                     column for column in sheet.get("columns", [])
-                    if not is_person_name_column(column)
+                    if (column_semantics.get(str(sheet.get("sheet_name")), {})
+                        .get(str(column), {}).get("usage_permission") != "blocked")
                 ]}
                 for sheet in sheets if str(sheet.get("role", "")).upper() == "DATA"
             ]
             profile_summary += f"Tên sheet và tiêu đề cột trong workbook: {sheet_schema}\n"
         for col_name, details in dataframe_profile.column_details.items():
-            if details.get("is_sensitive_person_name") or is_person_name_column(col_name):
+            if details.get("usage_permission") == "blocked":
                 continue
             dtype = str(details.get("type", "")).lower()
             type_label = ("numeric" if any(token in dtype for token in ("int", "float", "decimal"))
@@ -632,7 +635,8 @@ def draft_report(state: GraphState) -> GraphState:
                 - `conclusion_text`: Kết luận tổng hợp và bước tiếp theo hợp lý. Chỉ nêu giới hạn nếu
                   context có một giới hạn cụ thể đã kiểm chứng.
                 - `dataset_title`: Tiêu đề ngắn phản ánh đúng mục đích phân tích, không chứa tên file,
-                  đường dẫn, tên sheet/source_partition và không tự gán lĩnh vực.
+                  đường dẫn, tên sheet/source_partition và không tự gán lĩnh vực. Tiêu đề phải là
+                  cụm danh từ hoặc câu khẳng định, không được viết dưới dạng câu hỏi.
                 - `figure_id_map`: Ánh xạ placeholder như `[FIGURE 1]` tới `visual_id` thực tế.
                 - `clarification_questions`: Câu hỏi cần làm rõ nếu thiếu ngữ cảnh; để trống khi không cần.
 
@@ -643,6 +647,8 @@ def draft_report(state: GraphState) -> GraphState:
                   chứng, rồi giải thích hàm ý và hành động. Không lặp cùng một con số ở nhiều phần.
                 - Dùng tiêu đề giàu thông tin, mô tả điều thực sự xảy ra thay vì tiêu đề chung như
                   “Phân tích dữ liệu”, “Kết quả chính” hoặc “Một số nhận xét”.
+                - Tên báo cáo và mọi tiêu đề mục phải là cụm mô tả hoặc câu khẳng định; tuyệt đối
+                  không dùng dạng câu hỏi, từ hỏi hoặc dấu `?`.
                 - Khi có đề xuất, mở đầu bằng động từ hành động phù hợp lĩnh vực như “Ưu tiên”,
                   “Rà soát”, “Theo dõi”, “Thử nghiệm”, “Duy trì”; nêu rõ đối tượng và căn cứ.
                 - Phân biệt rõ kết quả quan sát, diễn giải và khuyến nghị. Giới hạn là tùy chọn, không

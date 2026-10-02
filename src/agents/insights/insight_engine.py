@@ -14,7 +14,6 @@ from data_io import effective_instructions
 from graph.state import GraphState
 from llm import get_llm, text_from_response
 from schemas.messages import AnalysisInsight
-from privacy import is_person_name_column
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +50,7 @@ def _profile_summary(state: GraphState, partition: str) -> str:
         details = profile.column_details if profile else {}
     lines = [f"Sheet/phần dữ liệu: {partition}", "Schema (chỉ tên cột và kiểu dữ liệu):"]
     for name, detail in details.items():
-        if detail.get("is_sensitive_person_name") or is_person_name_column(name):
+        if detail.get("usage_permission") == "blocked":
             continue
         dtype = str(detail.get("type", "")).lower()
         label = ("numeric" if any(x in dtype for x in ("int", "float", "decimal"))

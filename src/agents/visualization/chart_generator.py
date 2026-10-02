@@ -13,10 +13,11 @@ from llm import get_llm, text_from_response
 from pydantic import BaseModel, Field, ValidationError
 from graph.state import GraphState
 from schemas.messages import VisualGenerationInstruction, GeneratedVisual
-from data_io import (effective_instructions, infer_column_semantic, is_date_like_series, read_dataset_partitions,
-                     split_partitions_by_source, to_datetime_series)
-from privacy import is_person_name_column
-from agents.question_framer import compact_computed_results
+from data_io import (attach_column_semantics, column_semantic, column_usage_permission,
+                     effective_instructions,
+                     read_dataset_partitions, split_partitions_by_source,
+                     to_datetime_series)
+from src.agents.planning.question_framer import compact_computed_results
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,19 @@ def _is_readable_category(series: pd.Series) -> bool:
 def _is_readable_instruction(item: VisualGenerationInstruction, df: pd.DataFrame) -> bool:
     if not item.columns or not all(column in df.columns for column in item.columns):
         return False
-    if any(is_person_name_column(column, df[column]) for column in item.columns):
+    if any(str(column).startswith("_") for column in item.columns):
         return False
-    if any(infer_column_semantic(df[column], column) in {"identifier", "text", "unknown"}
+    if any(column_usage_permission(df, column) == "blocked"
            for column in item.columns):
         return False
     chart_type = item.type.lower()
+    group_only = [column for column in item.columns
+                  if column_usage_permission(df, column) == "group_only"]
+    if group_only and (
+        chart_type not in {"bar", "horizontal_bar", "pie"}
+        or any(column != item.columns[0] for column in group_only)
+    ):
+        return False
     if chart_type == "pie":
         return len(item.columns) == 1 and df[item.columns[0]].nunique(dropna=True) <= 6
     if chart_type in {"bar", "horizontal_bar"}:
@@ -69,7 +77,7 @@ def _is_readable_instruction(item: VisualGenerationInstruction, df: pd.DataFrame
             return _is_readable_category(df[axis_column])
     if chart_type in {"line", "area"} and item.columns:
         axis_column = item.columns[0]
-        if not _looks_like_date(df[axis_column]) and not pd.api.types.is_numeric_dtype(df[axis_column]):
+        if not _looks_like_date(df, axis_column) and not pd.api.types.is_numeric_dtype(df[axis_column]):
             return _is_readable_category(df[axis_column])
     return True
 
@@ -77,14 +85,17 @@ def _is_readable_instruction(item: VisualGenerationInstruction, df: pd.DataFrame
 def _fallback_suggestions(df: pd.DataFrame) -> List[VisualGenerationInstruction]:
     """Choose charts that a non-technical reader can understand quickly."""
     numeric = [column for column in df.select_dtypes(include="number").columns.tolist()
-               if not is_person_name_column(column, df[column])
-               and not is_date_like_series(df[column], str(column))]
+               if column_semantic(df, str(column)) == "numeric_measure"
+               and column_usage_permission(df, str(column)) == "full_analysis"]
     safe_columns = [column for column in df.columns if not str(column).startswith("_")
-                    and not is_person_name_column(column, df[column])]
-    date_column = next((column for column in safe_columns if _looks_like_date(df[column])), None)
+                    and column_usage_permission(df, str(column)) != "blocked"]
+    date_column = next((column for column in safe_columns if _looks_like_date(df, column)), None)
     categorical = [
         column for column in safe_columns
-        if column != date_column and column not in numeric and _is_readable_category(df[column])
+        if column != date_column
+        and column not in numeric
+        and column_semantic(df, str(column)) in {"categorical", "boolean_status", "person_name"}
+        and _is_readable_category(df[column])
     ]
     suggestions: List[VisualGenerationInstruction] = []
     if date_column and numeric:
@@ -186,8 +197,8 @@ def _chart_title_from_result(result) -> str:
     return f"Phân tích {' và '.join(result.columns)}"
 
 
-def _looks_like_date(series: pd.Series) -> bool:
-    return is_date_like_series(series)
+def _looks_like_date(df: pd.DataFrame, column: str) -> bool:
+    return column_semantic(df, column) == "datetime"
 
 
 def _reader_friendly(items: List[VisualGenerationInstruction], df: pd.DataFrame) -> List[VisualGenerationInstruction]:
@@ -326,9 +337,9 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
     Generates a chart based on the instruction and saves it to the output path.
     Returns the file_path if successful, None otherwise.
     """
-    if any(column in df.columns and is_person_name_column(column, df[column])
+    if any(column in df.columns and column_usage_permission(df, column) == "blocked"
            for column in instruction.columns):
-        logger.warning("Skipping chart that could expose or group personal names: %s", instruction.columns)
+        logger.warning("Skipping chart that uses columns blocked by the LLM: %s", instruction.columns)
         return None
     fig, ax = plt.subplots(figsize=(10, 5.6), facecolor="white")
     ax.set_facecolor("white")
@@ -419,7 +430,7 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
         elif instruction.type in {"line", "area"}:
             if len(instruction.columns) == 2:
                 x_col, y_col = instruction.columns[0], instruction.columns[1]
-                if _looks_like_date(df[x_col]):
+                if _looks_like_date(df, x_col):
                     df_temp = df.copy()
                     df_temp[x_col] = to_datetime_series(df_temp[x_col])
                     df_temp = df_temp.dropna(subset=[x_col, y_col]).sort_values(by=x_col)
@@ -453,7 +464,7 @@ def generate_chart(df: pd.DataFrame, instruction: VisualGenerationInstruction, o
                     f"df_temp = df.copy()\n"
                     f"df_temp[{x_col!r}] = to_datetime_series(df_temp[{x_col!r}])\n"
                     f"df_sorted = df_temp.set_index({x_col!r})[{y_col!r}].resample('MS').sum(min_count=1).reset_index()"
-                    if _looks_like_date(df[x_col]) else
+                    if _looks_like_date(df, x_col) else
                     f"df_sorted = df.sort_values(by={x_col!r})"
                 )
             else:
@@ -597,6 +608,7 @@ def generate_visuals(state: GraphState) -> GraphState:
         partitions = split_partitions_by_source(read_dataset_partitions(
             file_path, state.get("workbook_sheets"), state.get("instructions", "")
         ))
+        attach_column_semantics(partitions, state.get("column_semantics") or {})
         df = next(iter(partitions.values()))
         if not partitions or any(frame.empty for frame in partitions.values()):
             raise ValueError("Uploaded CSV is empty.")
@@ -711,10 +723,9 @@ def generate_visuals(state: GraphState) -> GraphState:
                 - `columns`: Danh sách 1 hoặc 2 tên cột chính xác trong dữ liệu. Cột phải tồn tại và
                   phù hợp với loại biểu đồ. Với xu hướng thời gian, cột đầu là thời gian và cột sau là số.
                   Với biểu đồ cột một biến phân loại, hệ thống sẽ đếm số bản ghi.
-                Không đề xuất bar/pie/line theo cột phân loại có hơn 12 giá trị khác nhau hoặc nhãn quá dài
-                  (ví dụ mã định danh, tên sản phẩm chi tiết, tên người hoặc nội dung văn bản tự do).
-                  Không dùng cột được đánh dấu `is_sensitive_person_name`; không hiển thị, đếm,
-                  xếp hạng hoặc phân nhóm tên người trên biểu đồ.
+                Không đề xuất bar/pie/line theo cột phân loại có hơn 12 giá trị khác nhau hoặc nhãn quá dài.
+                Tuân thủ `usage_permission`: không dùng cột `blocked`; cột `group_only` chỉ được dùng
+                  làm cột nhãn phân nhóm đầu tiên của bar, horizontal_bar hoặc pie; không dùng nó làm metric.
                 - `title`: Tiêu đề ngắn, chuyên nghiệp và phù hợp với lĩnh vực.
                 - `description`: Mô tả ngắn về điều biểu đồ giúp người đọc đánh giá.
                 - `suggested_section`: Tên phần báo cáo phù hợp với nội dung, không dùng tên phần
@@ -749,7 +760,7 @@ def generate_visuals(state: GraphState) -> GraphState:
             profile_payload = dataframe_profile.model_dump(exclude_unset=True)
             profile_payload["column_details"] = {
                 name: details for name, details in profile_payload.get("column_details", {}).items()
-                if not details.get("is_sensitive_person_name") and not is_person_name_column(name)
+                if details.get("usage_permission") != "blocked"
             }
             column_details_json = json.dumps(profile_payload, ensure_ascii=False, indent=2)
             llm_response = llm.invoke(prompt.invoke({

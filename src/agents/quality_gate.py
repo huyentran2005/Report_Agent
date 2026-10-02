@@ -12,7 +12,6 @@ import requests
 from graph.state import GraphState
 from schemas.messages import ReportSectionsDraft
 from data_io import effective_instructions
-from privacy import is_person_name_column
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -153,8 +152,7 @@ def validate_report(state: GraphState) -> GraphState:
                 "columns": {
                     name: details.get("type", "unknown")
                     for name, details in dataframe_profile.column_details.items()
-                    if not details.get("is_sensitive_person_name")
-                    and not is_person_name_column(name)
+                    if details.get("usage_permission") != "blocked"
                 },
             }
             prompt = PromptTemplate.from_template(prompt_template).format(

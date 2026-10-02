@@ -3,15 +3,15 @@ import logging
 
 from langgraph.graph import END, StateGraph
 
-from agents.data_profiler import profile_dataset
-from agents.question_framer import frame_questions
-from agents.insight_engine import extract_insights
-from agents.evidence_validator import validate_evidence
-from agents.report_planner import build_report_plan
-from agents.report_writer import draft_report
-from agents.report_exporter import export_report
+from src.agents.profiling.data_profiler import profile_dataset
+from src.agents.planning.question_framer import frame_questions
+from src.agents.insights.insight_engine import extract_insights
+from src.agents.insights.evidence_validator import validate_evidence
+from src.agents.reporting.report_planner import build_report_plan
+from src.agents.reporting.report_writer import draft_report
+from src.agents.reporting.report_exporter import export_report
 from agents.quality_gate import validate_report
-from agents.chart_generator import generate_visuals
+from src.agents.visualization.chart_generator import generate_visuals
 from graph.state import GraphState
 
 logger = logging.getLogger(__name__)

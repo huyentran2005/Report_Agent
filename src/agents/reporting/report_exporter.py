@@ -7,7 +7,7 @@ from datetime import datetime
 import markdown
 from graph.state import GraphState
 from schemas.messages import ReportFormat
-from agents.report_formatting import (
+from src.agents.reporting.report_formatting import (
     COLOR_GRAY_MUTED,
     COLOR_GRAY_TEXT,
     COLOR_NAVY,
